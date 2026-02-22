@@ -67,6 +67,23 @@
           "type": "number",
           "default": 1,
           "description": "Time step size for waveform sampling (in simulation time units)"
+        },
+        "hdlWaveAi.waveform.maxTransitions": {
+          "type": "number",
+          "default": 300,
+          "minimum": 50,
+          "description": "Maximum number of signal transitions to send to the LLM. If the collected transitions exceed this, they are evenly sampled to preserve temporal spread. Increase for larger models with bigger context windows."
+        },
+        "hdlWaveAi.chat.maxHistory": {
+          "type": "number",
+          "default": 20,
+          "minimum": 2,
+          "description": "Maximum number of chat messages to keep in context when conversational mode is enabled."
+        },
+        "hdlWaveAi.chat.conversational": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true (default), prior exchanges are included up to maxHistory. When false, each query is stateless — exactly 2 messages sent per inquiry (system + user)."
         }
       }
     }

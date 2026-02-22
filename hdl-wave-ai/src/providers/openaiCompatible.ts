@@ -18,4 +18,18 @@ export class OpenAICompatibleClient implements LLMProvider {
 
         return response.choices[0]?.message?.content ?? '';
     }
+
+    async *stream(messages: LLMMessage[], signal?: AbortSignal): AsyncGenerator<string> {
+        const stream = await this.client.chat.completions.create({
+            model: this.model,
+            messages: messages.map(m => ({ role: m.role, content: m.content })),
+            stream: true,
+        }, { signal });
+
+        for await (const chunk of stream) {
+            if (signal?.aborted) { break; }
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) { yield delta; }
+        }
+    }
 }

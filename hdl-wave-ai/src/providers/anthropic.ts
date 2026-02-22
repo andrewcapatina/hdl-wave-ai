@@ -26,4 +26,25 @@ export class AnthropicClient implements LLMProvider {
         const block = response.content[0];
         return block.type === 'text' ? block.text : '';
     }
+
+    async *stream(messages: LLMMessage[], signal?: AbortSignal): AsyncGenerator<string> {
+        const systemMsg = messages.find(m => m.role === 'system');
+        const conversationMessages = messages
+            .filter(m => m.role !== 'system')
+            .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+        const stream = this.client.messages.stream({
+            model: this.model,
+            max_tokens: 4096,
+            system: systemMsg?.content,
+            messages: conversationMessages,
+        }, { signal });
+
+        for await (const event of stream) {
+            if (signal?.aborted) { break; }
+            if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+                yield event.delta.text;
+            }
+        }
+    }
 }

@@ -5,15 +5,15 @@ import { buildWaveformContext, SignalTracker, WaveformContext } from '../vaporvi
 
 const SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
 
-You have access to:
-1. HDL source files from the current workspace
-2. Waveform signal transition data from the active simulation
+The first user message contains real waveform signal transition data and HDL source files extracted from the active simulation. You MUST base your analysis exclusively on that data — do not invent signal names, values, or behavior. Do not generate hypothetical examples or placeholder code.
 
-When analyzing issues:
-- Cross-reference signal behavior in the waveform against the HDL logic
+When answering:
+- Reference actual signal names and timestamps from the provided data
+- Cross-reference signal transitions against the HDL logic
 - Identify root causes, not just symptoms
 - Suggest concrete fixes or assertions where appropriate
-- Format signal names and values in backticks for readability`;
+- Format signal names and values in backticks`;
+
 
 export class ChatPanel {
     private static instance: ChatPanel | undefined;
@@ -21,6 +21,8 @@ export class ChatPanel {
     private readonly history: LLMMessage[] = [];
     private readonly tracker: SignalTracker;
     private readonly log: vscode.OutputChannel;
+    private waveformContextSent = false;   // only send waveform dump once per session
+    private currentAbortController: AbortController | undefined;
     private disposables: vscode.Disposable[] = [];
 
     private constructor(panel: vscode.WebviewPanel, tracker: SignalTracker, log: vscode.OutputChannel) {
@@ -59,6 +61,10 @@ export class ChatPanel {
     }
 
     private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number }) {
+        if (msg.type === 'stop') {
+            this.currentAbortController?.abort();
+            return;
+        }
         if (msg.type !== 'query' || !msg.text) { return; }
 
         const config = vscode.workspace.getConfiguration('hdlWaveAi');
@@ -67,43 +73,74 @@ export class ChatPanel {
         const startTime = msg.startTime ?? 0;
         const endTime = msg.endTime ?? 100000;
 
-        let contextBlock = '';
+        let userContent = msg.text;
 
-        this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
-        const waveformCtx: WaveformContext | null = await buildWaveformContext(this.tracker, startTime, endTime, stepSize);
-        this.log.appendLine(`[Chat] Waveform context done: ${waveformCtx ? waveformCtx.transitions.length + ' transitions' : 'null'}`);
-        if (waveformCtx) {
-            contextBlock += formatWaveformContext(waveformCtx);
+        // Only collect and send waveform + HDL context on the first message of a session
+        if (!this.waveformContextSent) {
+            let contextBlock = '';
+
+            this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
+            const waveformCtx: WaveformContext | null = await buildWaveformContext(this.tracker, startTime, endTime, stepSize);
+            this.log.appendLine(`[Chat] Waveform context done: ${waveformCtx ? waveformCtx.transitions.length + ' transitions' : 'null'}`);
+            if (waveformCtx) {
+                contextBlock += formatWaveformContext(waveformCtx, 300);
+            }
+
+            this.log.appendLine(`[Chat] Collecting HDL context`);
+            const hdlContext = await collectHdlContext();
+            this.log.appendLine(`[Chat] HDL context done: ${hdlContext ? hdlContext.length + ' chars' : 'null'}`);
+            if (hdlContext) {
+                contextBlock += '\n\n' + hdlContext;
+            }
+
+            if (contextBlock) {
+                userContent = `${contextBlock}\n\n---\n\n${msg.text}`;
+                this.waveformContextSent = true;
+            }
         }
 
-        this.log.appendLine(`[Chat] Collecting HDL context`);
-        const hdlContext = await collectHdlContext();
-        this.log.appendLine(`[Chat] HDL context done: ${hdlContext ? hdlContext.length + ' chars' : 'null'}`);
-        if (hdlContext) {
-            contextBlock += '\n\n' + hdlContext;
-        }
-
-        const userContent = contextBlock
-            ? `${contextBlock}\n\n---\n\n${msg.text}`
-            : msg.text;
-
+        const contextWasJustSent = this.waveformContextSent && userContent !== msg.text;
         this.history.push({ role: 'user', content: userContent });
 
-        const messages: LLMMessage[] = [
-            { role: 'system', content: SYSTEM_PROMPT },
-            ...this.history,
-        ];
+        const config2 = vscode.workspace.getConfiguration('hdlWaveAi');
+        const conversational = config2.get<boolean>('chat.conversational', true);
+        const maxHistory = config2.get<number>('chat.maxHistory', 20);
+
+        const messages: LLMMessage[] = conversational
+            ? [{ role: 'system', content: SYSTEM_PROMPT }, ...this.history.slice(-maxHistory)]
+            : [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }];
+
+        this.currentAbortController = new AbortController();
+        const { signal } = this.currentAbortController;
 
         try {
             const provider = createProvider();
-            this.log.appendLine(`[Chat] Sending ${messages.length} messages to LLM`);
-            const response = await provider.chat(messages);
-            this.history.push({ role: 'assistant', content: response });
-            this.panel.webview.postMessage({ type: 'response', text: response });
+            this.log.appendLine(`[Chat] Sending ${messages.length} messages to LLM (streaming)`);
+            this.panel.webview.postMessage({ type: 'stream_start' });
+            let fullResponse = '';
+            for await (const chunk of provider.stream(messages, signal)) {
+                fullResponse += chunk;
+                this.panel.webview.postMessage({ type: 'chunk', text: chunk });
+            }
+            if (fullResponse) {
+                this.history.push({ role: 'assistant', content: fullResponse });
+            }
+            this.panel.webview.postMessage({ type: 'stream_end' });
         } catch (err) {
-            const errMsg = err instanceof Error ? err.message : String(err);
-            this.log.appendLine(`[Chat] Error: ${errMsg}`);
-            this.panel.webview.postMessage({ type: 'error', text: errMsg });
+            if (signal.aborted) {
+                // Roll back the user message so the next query starts clean
+                this.history.pop();
+                if (contextWasJustSent) {
+                    this.waveformContextSent = false;
+                }
+                this.panel.webview.postMessage({ type: 'stream_end' });
+            } else {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                this.log.appendLine(`[Chat] Error: ${errMsg}`);
+                this.panel.webview.postMessage({ type: 'error', text: errMsg });
+            }
+        } finally {
+            this.currentAbortController = undefined;
         }
     }
 
@@ -115,19 +152,32 @@ export class ChatPanel {
     }
 }
 
-function formatWaveformContext(ctx: WaveformContext): string {
+function formatWaveformContext(ctx: WaveformContext, maxTransitions: number): string {
+    const config = vscode.workspace.getConfiguration('hdlWaveAi');
+    const cap = config.get<number>('waveform.maxTransitions', maxTransitions);
+
+    let transitions = ctx.transitions;
+    let truncated = false;
+    if (transitions.length > cap) {
+        // Evenly sample across the full time range to preserve temporal spread
+        const step = transitions.length / cap;
+        transitions = Array.from({ length: cap }, (_, i) => transitions[Math.round(i * step)]);
+        truncated = true;
+    }
+
     const lines = [
         `## Waveform Context`,
         `File: ${ctx.uri}`,
         `Time range: ${ctx.startTime} – ${ctx.endTime}`,
-        `Signals: ${ctx.signals.join(', ')}`,
+        `Signals (${ctx.signals.length}): ${ctx.signals.join(', ')}`,
+        `Transitions: ${transitions.length}${truncated ? ` (evenly sampled from ${ctx.transitions.length})` : ''}`,
         ``,
         `### Signal Transitions`,
         `time | signal | value`,
         `-----|--------|------`,
     ];
 
-    for (const t of ctx.transitions) {
+    for (const t of transitions) {
         lines.push(`${t.time} | ${t.signal} | ${t.value}`);
     }
 
@@ -213,7 +263,7 @@ function getWebviewHtml(): string {
     font-family: inherit;
     font-size: inherit;
   }
-  #send {
+  #send, #stop {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
     border: none;
@@ -221,8 +271,9 @@ function getWebviewHtml(): string {
     cursor: pointer;
     font-family: inherit;
   }
-  #send:hover { background: var(--vscode-button-hoverBackground); }
+  #send:hover, #stop:hover { background: var(--vscode-button-hoverBackground); }
   #send:disabled { opacity: 0.5; cursor: default; }
+  #stop { background: var(--vscode-errorForeground); display: none; }
 </style>
 </head>
 <body>
@@ -230,12 +281,14 @@ function getWebviewHtml(): string {
 <div id="input-area">
   <textarea id="input" rows="3" placeholder="Ask about your waveform or HDL design... (Shift+Enter for newline)"></textarea>
   <button id="send">Send</button>
+  <button id="stop">Stop</button>
 </div>
 <script>
   const vscode = acquireVsCodeApi();
   const messagesEl = document.getElementById('messages');
   const inputEl = document.getElementById('input');
   const sendEl = document.getElementById('send');
+  const stopEl = document.getElementById('stop');
 
   function addMessage(role, content) {
     const div = document.createElement('div');
@@ -259,6 +312,9 @@ function getWebviewHtml(): string {
   }
 
   sendEl.addEventListener('click', send);
+  stopEl.addEventListener('click', () => {
+    vscode.postMessage({ type: 'stop' });
+  });
 
   inputEl.addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -267,14 +323,66 @@ function getWebviewHtml(): string {
     }
   });
 
+  let streamBubble = null;
+  let loadingInterval = null;
+  let hasContent = false;
+
+  function startLoadingDots(bubble) {
+    const states = ['\u25cf', '\u25cf \u25cf', '\u25cf \u25cf \u25cf'];
+    let i = 0;
+    bubble.textContent = states[0];
+    bubble.style.opacity = '0.6';
+    loadingInterval = setInterval(() => {
+      i = (i + 1) % states.length;
+      bubble.textContent = states[i];
+    }, 400);
+  }
+
+  function stopLoadingDots(bubble) {
+    if (loadingInterval) {
+      clearInterval(loadingInterval);
+      loadingInterval = null;
+    }
+    bubble.style.opacity = '';
+  }
+
   window.addEventListener('message', e => {
     const msg = e.data;
-    if (msg.type === 'response') {
-      addMessage('assistant', msg.text);
+    if (msg.type === 'stream_start') {
+      const div = document.createElement('div');
+      div.className = 'message assistant';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      div.appendChild(bubble);
+      messagesEl.appendChild(div);
+      streamBubble = bubble;
+      hasContent = false;
+      startLoadingDots(bubble);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      stopEl.style.display = 'block';
+    } else if (msg.type === 'chunk') {
+      if (streamBubble) {
+        if (!hasContent) {
+          stopLoadingDots(streamBubble);
+          streamBubble.textContent = '';
+          hasContent = true;
+        }
+        streamBubble.textContent += msg.text;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+    } else if (msg.type === 'stream_end') {
+      if (streamBubble) { stopLoadingDots(streamBubble); }
+      streamBubble = null;
+      hasContent = false;
       sendEl.disabled = false;
+      stopEl.style.display = 'none';
     } else if (msg.type === 'error') {
+      if (streamBubble) { stopLoadingDots(streamBubble); }
+      streamBubble = null;
+      hasContent = false;
       addMessage('error', 'Error: ' + msg.text);
       sendEl.disabled = false;
+      stopEl.style.display = 'none';
     }
   });
 </script>

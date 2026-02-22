@@ -65,6 +65,40 @@ export class SignalTracker {
         return Array.from(this.signals.get(uri) ?? []);
     }
 
+    async initialize(): Promise<void> {
+        try {
+            const docs = await vscode.commands.executeCommand<{
+                documents: string[];
+                lastActiveDocument: string;
+            }>('waveformViewer.getOpenDocuments');
+
+            if (!docs?.documents?.length) { return; }
+
+            for (const uri of docs.documents) {
+                const state = await vscode.commands.executeCommand<{
+                    displayedSignals: Array<Record<string, unknown>>;
+                }>('waveformViewer.getViewerState', { uri });
+
+                this.log.appendLine(`[Tracker] initialize displayedSignals for ${uri}: ${JSON.stringify(state?.displayedSignals)}`);
+
+                if (!state?.displayedSignals?.length) { continue; }
+
+                if (!this.signals.has(uri)) {
+                    this.signals.set(uri, new Set());
+                }
+
+                for (const sig of state.displayedSignals) {
+                    const path = (sig['instancePath'] ?? sig['name']) as string | undefined;
+                    if (path) {
+                        this.signals.get(uri)!.add(path);
+                    }
+                }
+            }
+        } catch (err) {
+            this.log.appendLine(`[Tracker] initialize error: ${err}`);
+        }
+    }
+
     dispose() {
         for (const d of this.disposables) { d.dispose(); }
     }

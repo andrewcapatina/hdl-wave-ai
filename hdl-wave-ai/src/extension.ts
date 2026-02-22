@@ -6,6 +6,9 @@ export function activate(context: vscode.ExtensionContext) {
     const log = vscode.window.createOutputChannel('HDL Wave AI');
     const tracker = new SignalTracker(log);
 
+    // Seed tracker from any signals already displayed in VaporView
+    tracker.initialize();
+
     const openChat = vscode.commands.registerCommand('hdl-wave-ai.openChat', () => {
         ChatPanel.createOrShow(tracker, log);
     });

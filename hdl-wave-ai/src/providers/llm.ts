@@ -5,4 +5,5 @@ export interface LLMMessage {
 
 export interface LLMProvider {
     chat(messages: LLMMessage[]): Promise<string>;
+    stream(messages: LLMMessage[], signal?: AbortSignal): AsyncGenerator<string>;
 }
