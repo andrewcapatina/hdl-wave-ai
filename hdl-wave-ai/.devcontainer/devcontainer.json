@@ -1,0 +1,19 @@
+{
+    "name": "HDL Wave AI Dev",
+    "dockerFile": "../../Dockerfile",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace/hdl-wave-ai,type=bind",
+    "workspaceFolder": "/workspace/hdl-wave-ai",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "dbaeumer.vscode-eslint",
+                "ms-vscode.extension-test-runner"
+            ],
+            "settings": {
+                "terminal.integrated.defaultProfile.linux": "bash"
+            }
+        }
+    },
+    "postCreateCommand": "npm install",
+    "remoteUser": "root"
+}
