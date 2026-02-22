@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { createProvider } from '../providers/factory';
 import { LLMMessage } from '../providers/llm';
 import { buildWaveformContext, SignalTracker, WaveformContext } from '../vaporview/api';
+import { collectHdlContextSmart } from '../hdl/collector';
 
 const SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
 
@@ -87,7 +88,7 @@ export class ChatPanel {
             }
 
             this.log.appendLine(`[Chat] Collecting HDL context`);
-            const hdlContext = await collectHdlContext();
+            const hdlContext = await collectHdlContextSmart(waveformCtx?.signals ?? [], this.log);
             this.log.appendLine(`[Chat] HDL context done: ${hdlContext ? hdlContext.length + ' chars' : 'null'}`);
             if (hdlContext) {
                 contextBlock += '\n\n' + hdlContext;
@@ -184,21 +185,6 @@ function formatWaveformContext(ctx: WaveformContext, maxTransitions: number): st
     return lines.join('\n');
 }
 
-async function collectHdlContext(): Promise<string | null> {
-    const hdlFiles = await vscode.workspace.findFiles('**/*.{v,sv,vhd,vhdl}', '**/node_modules/**', 10);
-    if (hdlFiles.length === 0) { return null; }
-
-    const parts: string[] = ['## HDL Source Files'];
-
-    for (const uri of hdlFiles) {
-        const bytes = await vscode.workspace.fs.readFile(uri);
-        const text = Buffer.from(bytes).toString('utf8');
-        const relPath = vscode.workspace.asRelativePath(uri);
-        parts.push(`\n### ${relPath}\n\`\`\`verilog\n${text}\n\`\`\``);
-    }
-
-    return parts.join('\n');
-}
 
 function getWebviewHtml(): string {
     return `<!DOCTYPE html>

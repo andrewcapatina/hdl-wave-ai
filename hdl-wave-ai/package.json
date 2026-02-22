@@ -74,6 +74,24 @@
           "minimum": 50,
           "description": "Maximum number of signal transitions to send to the LLM. If the collected transitions exceed this, they are evenly sampled to preserve temporal spread. Increase for larger models with bigger context windows."
         },
+        "hdlWaveAi.hdl.searchPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional absolute directory paths to search for HDL source files (e.g. your RTL directory outside the workspace)"
+        },
+        "hdlWaveAi.hdl.maxModules": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "description": "Maximum number of HDL modules to send to the LLM, ranked by relevance to tracked signals"
+        },
+        "hdlWaveAi.hdl.maxCharsPerModule": {
+          "type": "number",
+          "default": 4000,
+          "minimum": 500,
+          "description": "Maximum characters per module. Larger modules are truncated at this limit."
+        },
         "hdlWaveAi.chat.maxHistory": {
           "type": "number",
           "default": 20,

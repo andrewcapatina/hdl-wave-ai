@@ -112,6 +112,8 @@ export async function getActiveDocumentUri(log: vscode.OutputChannel): Promise<s
     return docs?.lastActiveDocument ?? null;
 }
 
+const MAX_SAMPLE_ITERATIONS = 2000;
+
 export async function collectTransitions(
     uri: string,
     signals: string[],
@@ -127,8 +129,19 @@ export async function collectTransitions(
     // but keep a map back to the original display name
     const queryPaths = signals.map(s => s.replace(/\[[\d:]+\]$/, ''));
 
-    log.appendLine(`[Transitions] Collecting from t=${startTime} to t=${endTime}, ${signals.length} signals`);
-    for (let time = startTime; time <= endTime; time += stepSize) {
+    // Cap total API calls to avoid hanging when no markers are set and the
+    // time range is large (e.g. stepSize=1, endTime=100000 → 100k calls)
+    const range = endTime - startTime;
+    const effectiveStep = range > 0 && Math.ceil(range / stepSize) > MAX_SAMPLE_ITERATIONS
+        ? Math.ceil(range / MAX_SAMPLE_ITERATIONS)
+        : stepSize;
+
+    if (effectiveStep !== stepSize) {
+        log.appendLine(`[Transitions] Step size auto-adjusted: ${stepSize} → ${effectiveStep} (capped at ${MAX_SAMPLE_ITERATIONS} iterations over range ${range})`);
+    }
+
+    log.appendLine(`[Transitions] Collecting from t=${startTime} to t=${endTime}, step=${effectiveStep}, ${signals.length} signals`);
+    for (let time = startTime; time <= endTime; time += effectiveStep) {
         const raw = await vscode.commands.executeCommand<Array<{ instancePath: string; value: string }>>(
             'waveformViewer.getValuesAtTime',
             { uri, time, instancePaths: queryPaths }
@@ -190,14 +203,21 @@ export async function buildWaveformContext(
     const state = await vscode.commands.executeCommand<{
         markerTime: number | null;
         altMarkerTime: number | null;
+        timeEnd: number | null;    // VaporView may expose VCD end time under one of these names
+        maxTime: number | null;
+        totalTime: number | null;
     }>('waveformViewer.getViewerState', { uri });
 
+    // Best available VCD end time — fall back through candidate field names
+    const vcdEnd = state?.timeEnd ?? state?.maxTime ?? state?.totalTime ?? null;
+
+    const markersSet = state?.markerTime != null || state?.altMarkerTime != null;
     const t0 = state?.altMarkerTime ?? state?.markerTime ?? startTime;
-    const t1 = state?.markerTime ?? endTime;
+    const t1 = state?.markerTime ?? (markersSet ? endTime : (vcdEnd ?? endTime));
     const resolvedStart = Math.min(t0, t1);
     const resolvedEnd = Math.max(t0, t1);
 
-    tracker.log.appendLine(`[WaveformContext] Time range: ${resolvedStart} – ${resolvedEnd}`);
+    tracker.log.appendLine(`[WaveformContext] vcdEnd=${vcdEnd}, markersSet=${markersSet}, time range: ${resolvedStart} – ${resolvedEnd}`);
 
     const transitions = await collectTransitions(uri, signals, resolvedStart, resolvedEnd, stepSize, tracker.log);
     return { uri, signals, transitions, startTime: resolvedStart, endTime: resolvedEnd };
