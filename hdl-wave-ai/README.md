@@ -1,71 +1,141 @@
-# hdl-wave-ai README
+# HDL Wave AI
 
-This is the README for your extension "hdl-wave-ai". After writing up a brief description, we recommend including the following sections.
+AI-assisted hardware verification for VS Code. Connect your active simulation waveform to an LLM — ask questions about signal behavior, debug logic errors, and cross-reference transitions against your HDL source in natural language.
 
-## Features
-
-Describe specific features of your extension including screenshots of your extension in action. Image paths are relative to this README file.
-
-For example if there is an image subfolder under your extension project workspace:
-
-\!\[feature X\]\(images/feature-x.png\)
-
-> Tip: Many popular extensions utilize animations. This is an excellent way to show off your extension! We recommend short, focused animations that are easy to follow.
-
-## Requirements
-
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
-
-## Extension Settings
-
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
-
-For example:
-
-This extension contributes the following settings:
-
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
-
-## Known Issues
-
-Calling out known issues can help limit users opening duplicate issues against your extension.
-
-## Release Notes
-
-Users appreciate release notes as you update your extension.
-
-### 1.0.0
-
-Initial release of ...
-
-### 1.0.1
-
-Fixed issue #.
-
-### 1.1.0
-
-Added features X, Y, and Z.
+Built as a companion to the [VaporView](https://marketplace.visualstudio.com/items?itemName=lramseyer.vaporview) waveform viewer.
 
 ---
 
-## Following extension guidelines
+## How it works
 
-Ensure that you've read through the extensions guidelines and follow the best practices for creating your extension.
+1. Open a VCD/FST file in VaporView and add signals to the viewer
+2. Optionally place VaporView's markers to define a time window of interest
+3. Open the HDL Wave AI chat (`HDL Wave AI: Open Chat` from the Command Palette)
+4. Ask questions — the extension automatically injects:
+   - Signal transition data for the marked (or full) time range
+   - Relevant HDL module source ranked by match to your tracked signals
+5. Continue the conversation — subsequent messages use the same context without re-fetching
 
-* [Extension Guidelines](https://code.visualstudio.com/api/references/extension-guidelines)
+---
 
-## Working with Markdown
+## Requirements
 
-You can author your README using Visual Studio Code. Here are some useful editor keyboard shortcuts:
+- [VaporView](https://marketplace.visualstudio.com/items?itemName=lramseyer.vaporview) — VS Code will prompt you to install it automatically
+- An LLM provider: either an [Anthropic API key](https://console.anthropic.com/) or a locally running [Ollama](https://ollama.com/) instance
 
-* Split the editor (`Cmd+\` on macOS or `Ctrl+\` on Windows and Linux).
-* Toggle preview (`Shift+Cmd+V` on macOS or `Shift+Ctrl+V` on Windows and Linux).
-* Press `Ctrl+Space` (Windows, Linux, macOS) to see a list of Markdown snippets.
+---
 
-## For more information
+## Quick Start
 
-* [Visual Studio Code's Markdown Support](http://code.visualstudio.com/docs/languages/markdown)
-* [Markdown Syntax Reference](https://help.github.com/articles/markdown-basics/)
+### Using Claude (Anthropic)
 
-**Enjoy!**
+1. Install the extension
+2. Open VS Code Settings (`Ctrl+,`) and search `hdlWaveAi`
+3. Set **Provider** to `anthropic`
+4. Paste your Anthropic API key into **Anthropic: Api Key**
+5. Open a VCD in VaporView, add signals, then run `HDL Wave AI: Open Chat`
+
+### Using a local model via Ollama
+
+```bash
+# Install Ollama and pull a model
+ollama pull deepseek-coder-v2:16b
+```
+
+Set in VS Code Settings:
+- **Provider** → `openai-compatible`
+- **Openai Compatible: Base Url** → `http://localhost:11434/v1`
+- **Openai Compatible: Model** → `deepseek-coder-v2:16b`
+
+Or run Ollama via Docker Compose — see the [docker-compose example](https://github.com/capp/hdl-wave-ai) in the repo.
+
+---
+
+## Usage
+
+### Workflow
+
+1. Simulate your design and open the resulting VCD/FST file in VaporView
+2. Add the signals you care about to the VaporView signal list
+3. *(Optional)* Place VaporView's primary and alt markers to focus on a specific time window
+4. Run `HDL Wave AI: Open Chat` from the Command Palette (`Ctrl+Shift+P`)
+5. Ask questions — the first message automatically collects and injects waveform + HDL context
+
+### Tips
+
+- **Markers**: If no markers are set the extension samples the entire simulation. Setting both VaporView markers to bracket the region of interest gives the LLM a tighter, more relevant window.
+- **HDL source**: Open your RTL directory as the VS Code workspace, or configure `hdlWaveAi.hdl.searchPaths` to point at it. The extension finds modules whose signal names match what's in the viewer.
+- **Stop**: A **Stop** button appears during streaming — click it to cancel a response mid-generation without losing conversation history.
+
+### Generating a VCD for testing
+
+If you don't have a VCD handy, Icarus Verilog can generate one from any Verilog testbench:
+
+```bash
+sudo apt install iverilog
+iverilog -o sim testbench.v design.v && ./sim
+# produces output.vcd
+```
+
+Add `$dumpfile("output.vcd"); $dumpvars(0, tb);` to your testbench's `initial` block.
+
+---
+
+## Extension Settings
+
+| Setting | Default | Description |
+|---|---|---|
+| `hdlWaveAi.provider` | `anthropic` | LLM provider: `anthropic` or `openai-compatible` |
+| `hdlWaveAi.anthropic.apiKey` | — | Anthropic API key |
+| `hdlWaveAi.anthropic.model` | `claude-sonnet-4-6` | Anthropic model ID |
+| `hdlWaveAi.openaiCompatible.baseUrl` | `http://localhost:11434/v1` | Base URL for OpenAI-compatible API |
+| `hdlWaveAi.openaiCompatible.apiKey` | `ollama` | API key (any string works for Ollama) |
+| `hdlWaveAi.openaiCompatible.model` | `qwen2.5-coder:32b` | Model name |
+| `hdlWaveAi.waveform.sampleStepSize` | `1` | Time step size for waveform sampling |
+| `hdlWaveAi.waveform.maxTransitions` | `300` | Max transitions sent to the LLM (evenly sampled if exceeded) |
+| `hdlWaveAi.hdl.searchPaths` | `[]` | Extra absolute paths to search for HDL source files |
+| `hdlWaveAi.hdl.maxModules` | `5` | Max HDL modules to include, ranked by relevance |
+| `hdlWaveAi.hdl.maxCharsPerModule` | `4000` | Max characters per module before truncation |
+| `hdlWaveAi.chat.conversational` | `true` | Keep prior exchanges in context |
+| `hdlWaveAi.chat.maxHistory` | `20` | Max messages retained in conversational mode |
+
+### Tuning for larger models
+
+Models with bigger context windows (32b+) can handle more data. Increase these settings:
+
+```json
+"hdlWaveAi.waveform.maxTransitions": 1000,
+"hdlWaveAi.hdl.maxModules": 10,
+"hdlWaveAi.hdl.maxCharsPerModule": 8000
+```
+
+---
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `HDL Wave AI: Open Chat` | Open the AI chat panel |
+| `HDL Wave AI: Debug VaporView State` | Dump VaporView state to the Output channel for troubleshooting |
+
+---
+
+## Troubleshooting
+
+**No waveform context / "No signals tracked yet"**
+Add signals to VaporView before opening the chat. The extension reads whatever is currently displayed in the signal list.
+
+**HDL context not found**
+Either open your RTL directory as the VS Code workspace root, or add the path to `hdlWaveAi.hdl.searchPaths` in settings.
+
+**LLM not responding / very slow**
+For large VCDs with no markers set, the extension may sample many time steps. Set markers in VaporView to limit the time range, or increase `sampleStepSize`.
+
+**Check the Output channel**
+Run `HDL Wave AI: Debug VaporView State` and open the **HDL Wave AI** output channel (`View → Output`) to see what signals, URIs, and state are being read.
+
+---
+
+## License
+
+GPL-3.0 — see [LICENSE](LICENSE).

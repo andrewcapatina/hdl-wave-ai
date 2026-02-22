@@ -1,8 +1,10 @@
 {
+  "publisher": "capp",
   "name": "hdl-wave-ai",
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VaporView waveforms and local or cloud LLMs",
   "version": "0.0.1",
+  "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
   },
