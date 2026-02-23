@@ -8,7 +8,7 @@
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs",
   "icon": "icon.png",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"

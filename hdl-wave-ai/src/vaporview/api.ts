@@ -33,9 +33,14 @@ export class SignalTracker {
     private disposables: vscode.Disposable[] = [];
     readonly log: vscode.OutputChannel;
 
+    private readonly _onSignalsChanged = new vscode.EventEmitter<{ uri: string; signals: string[] }>();
+    /** Fires whenever signals are added or removed for any VaporView document. */
+    readonly onSignalsChanged = this._onSignalsChanged.event;
+
     constructor(log: vscode.OutputChannel) {
         this.log = log;
         this.subscribeToEvents();
+        this.disposables.push(this._onSignalsChanged);
     }
 
     private uriKey(uri: string | vscode.Uri | { fsPath?: string }): string {
@@ -55,6 +60,7 @@ export class SignalTracker {
                     this.signals.set(key, new Set());
                 }
                 this.signals.get(key)!.add(e.instancePath);
+                this._onSignalsChanged.fire({ uri: key, signals: Array.from(this.signals.get(key)!) });
             });
 
         const removeDisposable = vscode.extensions
@@ -64,6 +70,7 @@ export class SignalTracker {
                 this.log.appendLine(`[VaporView] onDidRemoveVariable: ${JSON.stringify(e)}`);
                 const key = this.uriKey(e.uri);
                 this.signals.get(key)?.delete(e.instancePath);
+                this._onSignalsChanged.fire({ uri: key, signals: Array.from(this.signals.get(key) ?? []) });
             });
 
         if (addDisposable) { this.disposables.push(addDisposable); }

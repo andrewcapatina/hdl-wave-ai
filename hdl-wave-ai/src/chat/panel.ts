@@ -17,7 +17,7 @@
 import * as vscode from 'vscode';
 import { createProvider } from '../providers/factory';
 import { LLMMessage } from '../providers/llm';
-import { buildWaveformContext, SignalTracker, WaveformContext } from '../vaporview/api';
+import { buildWaveformContext, getActiveDocumentUri, SignalTracker, WaveformContext } from '../vaporview/api';
 import { collectHdlContextSmart } from '../hdl/collector';
 
 const SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
@@ -43,6 +43,8 @@ export class ChatPanel {
     private disposables: vscode.Disposable[] = [];
     /** Pre-parsed context from a file (FST/VCD). When set, VaporView is bypassed. */
     private preloadedContext: WaveformContext | undefined;
+    /** Signals selected in the picker. undefined = not yet initialised (use all). */
+    private selectedSignals: string[] | undefined = undefined;
 
     private constructor(panel: vscode.WebviewPanel, tracker: SignalTracker, log: vscode.OutputChannel) {
         this.panel = panel;
@@ -102,7 +104,43 @@ export class ChatPanel {
         return instance;
     }
 
-    private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number }) {
+    /** Called when VaporView signals change — updates the picker in the open panel. */
+    static notifySignalsChanged(signals: string[]): void {
+        if (!ChatPanel.instance) { return; }
+        ChatPanel.instance.panel.webview.postMessage({ type: 'signals_update', signals });
+    }
+
+    /**
+     * Called from extension.ts when VaporView fires onDidSetMarker.
+     * Shows a clickable prompt suggestion in the chat if the panel is open.
+     */
+    static notifyMarkerSet(markerTime: number | null, altMarkerTime: number | null): void {
+        if (!ChatPanel.instance) { return; }
+
+        let display: string;
+        let query: string;
+
+        if (markerTime !== null && altMarkerTime !== null) {
+            const t0 = Math.min(markerTime, altMarkerTime);
+            const t1 = Math.max(markerTime, altMarkerTime);
+            display = `Analyze t=${t0} \u2013 t=${t1}`;
+            query = `Analyze all signal transitions between t=${t0} and t=${t1}. What events occur in this time window and what is the circuit doing?`;
+        } else if (markerTime !== null) {
+            display = `Analyze at t=${markerTime}`;
+            query = `What is the state of all signals at t=${markerTime}? Describe what the circuit is doing at this point.`;
+        } else if (altMarkerTime !== null) {
+            display = `Analyze at t=${altMarkerTime}`;
+            query = `What is the state of all signals at t=${altMarkerTime}? Describe what the circuit is doing at this point.`;
+        } else {
+            // Both markers cleared — dismiss any pending suggestion
+            ChatPanel.instance.panel.webview.postMessage({ type: 'clear_suggestions' });
+            return;
+        }
+
+        ChatPanel.instance.panel.webview.postMessage({ type: 'marker_suggestion', display, query });
+    }
+
+    private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number }): Promise<void> {
         if (msg.type === 'stop') {
             this.currentAbortController?.abort();
             return;
@@ -112,6 +150,29 @@ export class ChatPanel {
             this.history.splice(0);
             this.panel.webview.postMessage({ type: 'context_reset' });
             return;
+        }
+        if (msg.type === 'ready') {
+            // Webview just loaded — send current signal list to populate the picker
+            let signals: string[] = [];
+            if (this.preloadedContext) {
+                signals = this.preloadedContext.signals;
+            } else {
+                const activeUri = await getActiveDocumentUri(this.log);
+                if (activeUri) { signals = this.tracker.getSignals(activeUri); }
+            }
+            this.panel.webview.postMessage({ type: 'signals_update', signals });
+            return;
+        }
+        if (msg.type === 'signals_selected') {
+            this.selectedSignals = (msg as { type: string; signals?: string[] }).signals ?? [];
+            return;
+        }
+        // Sent by a suggestion chip click: refresh context then run the query
+        if (msg.type === 'marker_query' && msg.text) {
+            this.waveformContextSent = false;
+            this.history.splice(0);
+            // Re-dispatch as a normal query so the full collection + LLM path runs
+            return this.handleMessage({ type: 'query', text: msg.text });
         }
         if (msg.type !== 'query' || !msg.text) { return; }
 
@@ -133,29 +194,40 @@ export class ChatPanel {
         // Only collect and send waveform + HDL context on the first message of a session
         if (!this.waveformContextSent) {
             let contextBlock = '';
-            let contextSignals: string[] = [];
+            let rawCtx: WaveformContext | null = null;
 
             if (this.preloadedContext) {
                 // ── File mode (FST / VCD parsed directly) ──────────────────
                 this.log.appendLine(`[Chat] Using preloaded file context (${this.preloadedContext.transitions.length} transitions)`);
-                contextBlock += formatWaveformContext(this.preloadedContext, 300);
-                contextSignals = this.preloadedContext.signals;
+                rawCtx = this.preloadedContext;
             } else {
                 // ── VaporView mode ──────────────────────────────────────────
                 this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
-                const waveformCtx: WaveformContext | null = await buildWaveformContext(this.tracker, startTime, endTime, stepSize, signal);
-                this.log.appendLine(`[Chat] Waveform context done: ${waveformCtx ? waveformCtx.transitions.length + ' transitions' : 'null'}`);
+                rawCtx = await buildWaveformContext(this.tracker, startTime, endTime, stepSize, signal);
+                this.log.appendLine(`[Chat] Waveform context done: ${rawCtx ? rawCtx.transitions.length + ' transitions' : 'null'}`);
 
                 if (signal.aborted) {
                     this.panel.webview.postMessage({ type: 'stream_end' });
                     this.currentAbortController = undefined;
                     return;
                 }
+            }
 
-                if (waveformCtx) {
-                    contextBlock += formatWaveformContext(waveformCtx, 300);
-                    contextSignals = waveformCtx.signals;
-                }
+            // Apply signal picker selection filter
+            let finalCtx = rawCtx;
+            if (finalCtx && this.selectedSignals !== undefined && this.selectedSignals.length > 0) {
+                const selSet = new Set(this.selectedSignals);
+                finalCtx = {
+                    ...finalCtx,
+                    signals: finalCtx.signals.filter(s => selSet.has(s)),
+                    transitions: finalCtx.transitions.filter(t => selSet.has(t.signal)),
+                };
+                this.log.appendLine(`[Chat] Signal filter applied: ${finalCtx.signals.length}/${rawCtx!.signals.length} signals, ${finalCtx.transitions.length} transitions`);
+            }
+
+            const contextSignals = finalCtx?.signals ?? [];
+            if (finalCtx) {
+                contextBlock += formatWaveformContext(finalCtx, 300);
             }
 
             this.log.appendLine(`[Chat] Collecting HDL context`);
@@ -410,13 +482,87 @@ function getWebviewHtml(): string {
     font-size: 0.85em;
     padding: 2px 0;
   }
+  /* ── Signal picker ──────────────────────────────────────────────── */
+  #signal-picker { border-bottom: 1px solid var(--vscode-panel-border); font-size: 0.85em; }
+  #signal-picker-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 5px 12px; cursor: pointer; user-select: none;
+    color: var(--vscode-descriptionForeground);
+  }
+  #signal-picker-header:hover { background: var(--vscode-toolbar-hoverBackground); }
+  #signal-picker-toggle { display: flex; align-items: center; gap: 5px; }
+  #signal-picker-ctrls { display: flex; gap: 8px; }
+  .sp-btn {
+    background: none; border: none; padding: 0;
+    color: var(--vscode-textLink-foreground);
+    cursor: pointer; font-size: inherit;
+  }
+  .sp-btn:hover { text-decoration: underline; }
+  #signal-picker-list {
+    padding: 4px 12px 8px; display: flex; flex-direction: column;
+    gap: 3px; max-height: 150px; overflow-y: auto;
+  }
+  #signal-picker-list.hidden { display: none; }
+  .signal-item { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+  .signal-item input[type=checkbox] { cursor: pointer; flex-shrink: 0; }
+  .signal-item label {
+    cursor: pointer; font-family: var(--vscode-editor-font-family, monospace);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  #signal-picker-empty {
+    color: var(--vscode-descriptionForeground); font-style: italic; padding: 2px 0;
+  }
+  /* ── Suggestions ──────────────────────────────────────────────── */
+  #suggestions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 12px 6px;
+    min-height: 0;
+  }
+  #suggestions:empty { display: none; }
+  .suggestion-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.15));
+    color: var(--vscode-button-secondaryForeground, var(--vscode-foreground));
+    border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+    border-radius: 12px;
+    padding: 3px 10px 3px 12px;
+    font-size: 0.85em;
+    cursor: pointer;
+    transition: opacity 0.1s;
+  }
+  .suggestion-chip:hover { opacity: 0.85; }
+  .suggestion-chip .chip-label::before { content: '\\26A1\\FE0E\\00A0'; }
+  .suggestion-chip .chip-dismiss {
+    opacity: 0.5;
+    font-size: 1.1em;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .suggestion-chip .chip-dismiss:hover { opacity: 1; }
 </style>
 </head>
 <body>
 <div id="toolbar">
   <button id="refresh">&#8635; Refresh Context</button>
 </div>
+<div id="signal-picker">
+  <div id="signal-picker-header">
+    <span id="signal-picker-toggle">&#9654; Signals</span>
+    <span id="signal-picker-ctrls" style="display:none">
+      <button class="sp-btn" id="sp-all">All</button>
+      <button class="sp-btn" id="sp-none">None</button>
+    </span>
+  </div>
+  <div id="signal-picker-list" class="hidden">
+    <div id="signal-picker-empty">Add signals in VaporView to see them here.</div>
+  </div>
+</div>
 <div id="messages"></div>
+<div id="suggestions"></div>
 <div id="input-area">
   <textarea id="input" rows="3" placeholder="Ask about your waveform or HDL design... (Shift+Enter for newline)"></textarea>
   <button id="send">Send</button>
@@ -429,6 +575,124 @@ function getWebviewHtml(): string {
   const sendEl = document.getElementById('send');
   const stopEl = document.getElementById('stop');
   const refreshEl = document.getElementById('refresh');
+  const suggestionsEl = document.getElementById('suggestions');
+
+  // ── Signal picker ────────────────────────────────────────────────────────
+  const pickerHeader  = document.getElementById('signal-picker-header');
+  const pickerToggle  = document.getElementById('signal-picker-toggle');
+  const pickerList    = document.getElementById('signal-picker-list');
+  const pickerCtrls   = document.getElementById('signal-picker-ctrls');
+  const spAllBtn      = document.getElementById('sp-all');
+  const spNoneBtn     = document.getElementById('sp-none');
+
+  let pickerOpen = false;
+  let availableSignals = [];
+  let selectedSignals  = new Set();
+
+  function updatePickerHeader() {
+    const total    = availableSignals.length;
+    const sel      = selectedSignals.size;
+    const arrow    = pickerOpen ? '\u25BE' : '\u25B8';
+    const countStr = total === 0 ? '' : sel === total ? ' (' + total + ')' : ' (' + sel + '/' + total + ')';
+    pickerToggle.textContent = arrow + ' Signals' + countStr;
+    pickerCtrls.style.display = (pickerOpen && total > 0) ? 'flex' : 'none';
+  }
+
+  function renderSignalList() {
+    pickerList.innerHTML = '';
+    if (availableSignals.length === 0) {
+      const msg = document.createElement('div');
+      msg.id = 'signal-picker-empty';
+      msg.textContent = 'Add signals in VaporView to see them here.';
+      pickerList.appendChild(msg);
+      return;
+    }
+    for (const sig of availableSignals) {
+      const item = document.createElement('div');
+      item.className = 'signal-item';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.id = 'spck-' + sig;
+      cb.checked = selectedSignals.has(sig);
+      cb.addEventListener('change', () => {
+        if (cb.checked) { selectedSignals.add(sig); } else { selectedSignals.delete(sig); }
+        updatePickerHeader();
+        postSignalSelection();
+      });
+      const lbl = document.createElement('label');
+      lbl.htmlFor = 'spck-' + sig;
+      lbl.textContent = sig;
+      item.appendChild(cb);
+      item.appendChild(lbl);
+      pickerList.appendChild(item);
+    }
+  }
+
+  function postSignalSelection() {
+    if (availableSignals.length > 0) {
+      vscode.postMessage({ type: 'signals_selected', signals: Array.from(selectedSignals) });
+    }
+  }
+
+  pickerHeader.addEventListener('click', () => {
+    pickerOpen = !pickerOpen;
+    pickerList.className = pickerOpen ? '' : 'hidden';
+    updatePickerHeader();
+  });
+
+  spAllBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    for (const s of availableSignals) { selectedSignals.add(s); }
+    renderSignalList(); updatePickerHeader(); postSignalSelection();
+  });
+
+  spNoneBtn.addEventListener('click', e => {
+    e.stopPropagation();
+    selectedSignals.clear();
+    renderSignalList(); updatePickerHeader(); postSignalSelection();
+  });
+
+  function applySignalsUpdate(signals) {
+    const prevAvailable = new Set(availableSignals);
+    availableSignals = signals;
+    // New signals default to selected; signals removed from VaporView are dropped
+    for (const s of signals)  { if (!prevAvailable.has(s)) { selectedSignals.add(s); } }
+    for (const s of selectedSignals) { if (!signals.includes(s)) { selectedSignals.delete(s); } }
+    renderSignalList();
+    updatePickerHeader();
+    postSignalSelection();
+  }
+
+  // ── Suggestion chips ─────────────────────────────────────────────────────
+  function showSuggestionChip(display, query) {
+    suggestionsEl.innerHTML = ''; // only one chip at a time
+    const chip = document.createElement('div');
+    chip.className = 'suggestion-chip';
+
+    const label = document.createElement('span');
+    label.className = 'chip-label';
+    label.textContent = display;
+
+    const dismiss = document.createElement('span');
+    dismiss.className = 'chip-dismiss';
+    dismiss.textContent = '\u00d7';
+    dismiss.title = 'Dismiss';
+    dismiss.addEventListener('click', e => {
+      e.stopPropagation();
+      chip.remove();
+    });
+
+    chip.appendChild(label);
+    chip.appendChild(dismiss);
+    chip.addEventListener('click', () => {
+      suggestionsEl.innerHTML = '';
+      addMessage('user', query);
+      sendEl.disabled = true;
+      vscode.postMessage({ type: 'marker_query', text: query });
+    });
+
+    suggestionsEl.appendChild(chip);
+  }
 
   function addMessage(role, content) {
     const div = document.createElement('div');
@@ -556,8 +820,17 @@ function getWebviewHtml(): string {
       div.appendChild(bubble);
       messagesEl.appendChild(div);
       messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (msg.type === 'marker_suggestion') {
+      showSuggestionChip(msg.display, msg.query);
+    } else if (msg.type === 'clear_suggestions') {
+      suggestionsEl.innerHTML = '';
+    } else if (msg.type === 'signals_update') {
+      applySignalsUpdate(msg.signals ?? []);
     }
   });
+
+  // Tell the extension the webview is ready so it can send initial signals
+  vscode.postMessage({ type: 'ready' });
 </script>
 </body>
 </html>`;

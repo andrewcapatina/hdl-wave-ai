@@ -11,6 +11,13 @@ export function activate(context: vscode.ExtensionContext) {
     // Seed tracker from any signals already displayed in VaporView
     tracker.initialize();
 
+    // Keep the chat panel's signal picker in sync with VaporView
+    context.subscriptions.push(
+        tracker.onSignalsChanged(({ signals }) => {
+            ChatPanel.notifySignalsChanged(signals);
+        })
+    );
+
     const openChat = vscode.commands.registerCommand('hdl-wave-ai.openChat', () => {
         ChatPanel.createOrShow(tracker, log);
     });
@@ -82,6 +89,25 @@ export function activate(context: vscode.ExtensionContext) {
         // Tracked signals
         log.appendLine(`[Debug] Tracked signals: ${JSON.stringify(uri ? tracker.getSignals(uri) : [])}`);
     });
+
+    // Forward VaporView marker events to the chat panel as prompt suggestions.
+    // The event fires with { uri: UriObject, time: number, units: string } for each
+    // individual marker placement — query getViewerState afterward to get both
+    // markers (main + alt) at once.
+    const vaporExt = vscode.extensions.getExtension('lramseyer.vaporview');
+    const markerSub = vaporExt?.exports?.onDidSetMarker(
+        async (e: { uri?: { external?: string; fsPath?: string }; time?: number; units?: string }) => {
+            log.appendLine(`[Marker] onDidSetMarker: ${JSON.stringify(e)}`);
+            const uri = e.uri?.external ?? (e.uri?.fsPath ? `file://${e.uri.fsPath}` : undefined);
+            if (!uri) { return; }
+            const state = await vscode.commands.executeCommand<{
+                markerTime: number | null;
+                altMarkerTime: number | null;
+            }>('waveformViewer.getViewerState', { uri });
+            ChatPanel.notifyMarkerSet(state?.markerTime ?? null, state?.altMarkerTime ?? null);
+        }
+    );
+    if (markerSub) { context.subscriptions.push(markerSub); }
 
     context.subscriptions.push(openChat, openChatWithFile, debug, tracker, log);
 }
