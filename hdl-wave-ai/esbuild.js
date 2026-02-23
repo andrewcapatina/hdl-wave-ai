@@ -24,29 +24,41 @@ const esbuildProblemMatcherPlugin = {
 };
 
 async function main() {
-	const ctx = await esbuild.context({
-		entryPoints: [
-			'src/extension.ts'
-		],
+	const commonOptions = {
 		bundle: true,
 		format: 'cjs',
 		minify: production,
 		sourcemap: !production,
 		sourcesContent: false,
 		platform: 'node',
+		logLevel: 'silent',
+		plugins: [esbuildProblemMatcherPlugin],
+	};
+
+	// VSCode extension build
+	const extCtx = await esbuild.context({
+		...commonOptions,
+		entryPoints: ['src/extension.ts'],
 		outfile: 'dist/extension.js',
 		external: ['vscode'],
-		logLevel: 'silent',
-		plugins: [
-			/* add to the end of plugins array */
-			esbuildProblemMatcherPlugin,
-		],
 	});
+
+	// Standalone MCP server build
+	const mcpCtx = await esbuild.context({
+		...commonOptions,
+		entryPoints: ['src/mcp/server.ts'],
+		outfile: 'dist/mcp-server.js',
+		banner: { js: '#!/usr/bin/env node' },
+	});
+
 	if (watch) {
-		await ctx.watch();
+		await extCtx.watch();
+		await mcpCtx.watch();
 	} else {
-		await ctx.rebuild();
-		await ctx.dispose();
+		await extCtx.rebuild();
+		await mcpCtx.rebuild();
+		await extCtx.dispose();
+		await mcpCtx.dispose();
 	}
 }
 

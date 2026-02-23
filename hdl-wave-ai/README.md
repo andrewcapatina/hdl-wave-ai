@@ -81,6 +81,91 @@ Add `$dumpfile("output.vcd"); $dumpvars(0, tb);` to your testbench's `initial` b
 
 ---
 
+## Tool-Use (RAG) Mode
+
+For large designs with millions of signal transitions, the extension uses a tool-calling approach instead of dumping all transitions into the LLM context. The LLM receives a compact waveform summary and queries signal data on-demand through tools.
+
+This is enabled by default (`hdlWaveAi.waveform.useToolMode: true`) and works with both Anthropic and OpenAI-compatible providers. If the provider doesn't support tool calling, it falls back to legacy mode automatically.
+
+---
+
+## MCP Server
+
+The extension includes a standalone MCP (Model Context Protocol) server that exposes waveform query tools to any MCP-compatible client — Claude Code, Claude Desktop, Cursor, and others. This runs independently of VS Code.
+
+### Setup
+
+Build the server (if not already built):
+
+```bash
+cd hdl-wave-ai
+npm install
+npm run compile
+```
+
+This produces `dist/mcp-server.js`.
+
+### Claude Code
+
+```bash
+claude mcp add hdl-wave-ai node /path/to/hdl-wave-ai/dist/mcp-server.js
+```
+
+Or to pre-load a waveform on startup:
+
+```bash
+claude mcp add hdl-wave-ai node -- /path/to/hdl-wave-ai/dist/mcp-server.js /path/to/waveform.vcd
+```
+
+### Claude Desktop
+
+Add to your `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "hdl-wave-ai": {
+      "command": "node",
+      "args": ["/path/to/hdl-wave-ai/dist/mcp-server.js"]
+    }
+  }
+}
+```
+
+### Project-level config (`.mcp.json`)
+
+```json
+{
+  "mcpServers": {
+    "hdl-wave-ai": {
+      "command": "node",
+      "args": ["/path/to/hdl-wave-ai/dist/mcp-server.js", "/path/to/waveform.vcd"]
+    }
+  }
+}
+```
+
+### Available Tools
+
+| Tool | Description |
+|---|---|
+| `load_waveform` | Load a VCD or FST file (replaces any previously loaded waveform) |
+| `list_signals` | List all signals with transition counts |
+| `query_transitions` | Get transitions for a signal in a time range (capped at 150) |
+| `get_value_at` | Get the value of a signal at a specific timestamp |
+
+### Example Prompt
+
+After loading a waveform, try:
+
+> Load the waveform at /path/to/design.vcd, then analyze signal activity between t=4200000 and t=4220000. What instructions is the CPU fetching and are there any anomalies?
+
+### FST Support
+
+FST files require `fst2vcd` (part of [GTKWave](https://gtkwave.sourceforge.net/)) to be installed and on your PATH.
+
+---
+
 ## Extension Settings
 
 | Setting | Default | Description |
@@ -91,8 +176,10 @@ Add `$dumpfile("output.vcd"); $dumpvars(0, tb);` to your testbench's `initial` b
 | `hdlWaveAi.openaiCompatible.baseUrl` | `http://localhost:11434/v1` | Base URL for OpenAI-compatible API |
 | `hdlWaveAi.openaiCompatible.apiKey` | `ollama` | API key (any string works for Ollama) |
 | `hdlWaveAi.openaiCompatible.model` | `qwen2.5-coder:32b` | Model name |
+| `hdlWaveAi.waveform.useToolMode` | `true` | Use tool-calling (RAG) mode for waveform analysis |
 | `hdlWaveAi.waveform.sampleStepSize` | `1` | Time step size for waveform sampling |
-| `hdlWaveAi.waveform.maxTransitions` | `300` | Max transitions sent to the LLM (evenly sampled if exceeded) |
+| `hdlWaveAi.waveform.maxTransitions` | `300` | Max transitions sent to the LLM in legacy mode (evenly sampled if exceeded) |
+| `hdlWaveAi.waveform.defaultEndTime` | `10000` | Fallback end time when no VaporView markers are set |
 | `hdlWaveAi.hdl.searchPaths` | `[]` | Extra absolute paths to search for HDL source files |
 | `hdlWaveAi.hdl.maxModules` | `5` | Max HDL modules to include, ranked by relevance |
 | `hdlWaveAi.hdl.maxCharsPerModule` | `4000` | Max characters per module before truncation |

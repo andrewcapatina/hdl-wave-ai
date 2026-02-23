@@ -283,8 +283,11 @@ export class ChatPanel {
                 }
             }
 
-            if (!canUseTools) {
-                // ── Legacy mode: dump transitions into the message ────────────
+            if (canUseTools && this.waveformIndex) {
+                // Tool mode ready — context will be injected in the tool loop below
+                this.waveformContextSent = true;
+            } else {
+                // ── Legacy mode (or fallback when tool index failed) ──────────
                 let finalCtx = rawCtx;
                 if (finalCtx && this.selectedSignals !== undefined && this.selectedSignals.length > 0) {
                     const selSet = new Set(this.selectedSignals);
@@ -307,8 +310,6 @@ export class ChatPanel {
                     userContent = `${contextBlock}\n\n---\n\n${msg.text}`;
                     this.waveformContextSent = true;
                 }
-            } else {
-                this.waveformContextSent = true; // prevent re-collection on follow-ups
             }
         }
 
