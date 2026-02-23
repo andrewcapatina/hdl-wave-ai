@@ -47,7 +47,7 @@ Set in VS Code Settings:
 - **Openai Compatible: Base Url** → `http://localhost:11434/v1`
 - **Openai Compatible: Model** → `deepseek-coder-v2:16b`
 
-Or run Ollama via Docker Compose — see the [docker-compose example](https://github.com/capp/hdl-wave-ai) in the repo.
+Or run Ollama via Docker Compose — see the [docker-compose example](https://github.com/andrewcapatina/hdl-wave-ai) in the repo.
 
 ---
 
@@ -138,4 +138,4 @@ Run `HDL Wave AI: Debug VaporView State` and open the **HDL Wave AI** output cha
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+AGPL-3.0 — see [LICENSE](https://github.com/andrewcapatina/hdl-wave-ai/blob/main/hdl-wave-ai/LICENSE).

@@ -128,7 +128,9 @@ export async function getActiveDocumentUri(log: vscode.OutputChannel): Promise<s
     return docs?.lastActiveDocument ?? null;
 }
 
-const MAX_SAMPLE_ITERATIONS = 2000;
+const MAX_SAMPLE_ITERATIONS = 100;
+const EARLY_EXIT_EMPTY_STREAK = 5;    // stop if VaporView returns empty N times in a row
+const EARLY_EXIT_NO_CHANGE_STREAK = 5; // stop if no new transitions for N consecutive samples (held values past sim end)
 
 export async function collectTransitions(
     uri: string,
@@ -136,13 +138,13 @@ export async function collectTransitions(
     startTime: number,
     endTime: number,
     stepSize: number,
-    log: vscode.OutputChannel
+    log: vscode.OutputChannel,
+    signal?: AbortSignal
 ): Promise<SignalTransition[]> {
     const transitions: SignalTransition[] = [];
     const lastValues: Record<string, string> = {};
 
     // Strip bit range notation for the query (e.g. "sig[3:0]" -> "sig")
-    // but keep a map back to the original display name
     const queryPaths = signals.map(s => s.replace(/\[[\d:]+\]$/, ''));
 
     // Cap total API calls to avoid hanging when no markers are set and the
@@ -157,37 +159,83 @@ export async function collectTransitions(
     }
 
     log.appendLine(`[Transitions] Collecting from t=${startTime} to t=${endTime}, step=${effectiveStep}, ${signals.length} signals`);
+    let emptyStreak = 0;
+    let noChangeStreak = 0;
+    let samplesWithData = 0;
+
     for (let time = startTime; time <= endTime; time += effectiveStep) {
+        if (signal?.aborted) {
+            log.appendLine('[Transitions] Collection aborted by user');
+            break;
+        }
+
         const raw = await vscode.commands.executeCommand<Array<{ instancePath: string; value: string }>>(
             'waveformViewer.getValuesAtTime',
             { uri, time, instancePaths: queryPaths }
         );
 
-        if (!raw || !Array.isArray(raw)) { continue; }
+        if (!raw || !Array.isArray(raw) || raw.length === 0) {
+            emptyStreak++;
+            if (emptyStreak >= EARLY_EXIT_EMPTY_STREAK) {
+                log.appendLine(`[Transitions] Early exit at t=${time}: ${emptyStreak} consecutive empty responses`);
+                break;
+            }
+            continue;
+        }
+        emptyStreak = 0;
+        samplesWithData++;
 
         if (time === startTime) {
             log.appendLine(`[Transitions] Raw values at t=${time}: ${JSON.stringify(raw)}`);
         }
 
+        const prevCount = transitions.length;
+        let anyExactTransition = false;
+
         for (const entry of raw) {
-            const signal = entry.instancePath;
-            // value is a JSON-encoded array e.g. "[\"0010\"]" or "[\"1\"]"
-            let bits: string;
-            try {
-                const parsed = JSON.parse(entry.value);
-                bits = Array.isArray(parsed) ? String(parsed[0]) : String(parsed);
-            } catch {
-                bits = entry.value;
+            const sig = entry.instancePath;
+
+            // value is [current] or [previous, current] — handle both JSON string
+            // and actual array (API may return either depending on VaporView version)
+            let parsed: unknown;
+            if (typeof (entry as { value: unknown }).value === 'string') {
+                try { parsed = JSON.parse(entry.value); } catch { parsed = entry.value; }
+            } else {
+                parsed = (entry as { value: unknown }).value;
             }
-            // Convert binary string to hex for readability (e.g. "1101" -> "d")
+
+            // Always take the LAST element as the current value
+            // (length-1 array: [current]; length-2 array: [previous, current])
+            let bits: string;
+            if (Array.isArray(parsed)) {
+                if (parsed.length === 2) { anyExactTransition = true; }
+                bits = String(parsed[parsed.length - 1]);
+            } else {
+                bits = String(parsed);
+            }
+
             const strValue = /^[01]+$/.test(bits) && bits.length > 1
                 ? `${bits} (0x${parseInt(bits, 2).toString(16).toUpperCase()})`
                 : bits;
 
-            if (lastValues[signal] !== strValue) {
-                transitions.push({ time, signal, value: strValue });
-                lastValues[signal] = strValue;
+            if (lastValues[sig] !== strValue) {
+                transitions.push({ time, signal: sig, value: strValue });
+                lastValues[sig] = strValue;
             }
+        }
+
+        // Two complementary end-of-simulation detectors:
+        // 1. No exact transitions (value.length===2) — reliable when step aligns with clock
+        // 2. No value changes vs lastValues — reliable across any step size
+        const noChangeThisSample = transitions.length === prevCount;
+        if ((noChangeThisSample || !anyExactTransition) && samplesWithData > 1) {
+            noChangeStreak++;
+            if (noChangeStreak >= EARLY_EXIT_NO_CHANGE_STREAK) {
+                log.appendLine(`[Transitions] Early exit at t=${time}: ${noChangeStreak} consecutive no-change samples (past simulation end)`);
+                break;
+            }
+        } else {
+            noChangeStreak = 0;
         }
     }
 
@@ -199,7 +247,8 @@ export async function buildWaveformContext(
     tracker: SignalTracker,
     startTime: number,
     endTime: number,
-    stepSize: number
+    stepSize: number,
+    signal?: AbortSignal
 ): Promise<WaveformContext | null> {
     const uri = await getActiveDocumentUri(tracker.log);
     if (!uri) {
@@ -227,14 +276,32 @@ export async function buildWaveformContext(
     // Best available VCD end time — fall back through candidate field names
     const vcdEnd = state?.timeEnd ?? state?.maxTime ?? state?.totalTime ?? null;
 
-    const markersSet = state?.markerTime != null || state?.altMarkerTime != null;
-    const t0 = state?.altMarkerTime ?? state?.markerTime ?? startTime;
-    const t1 = state?.markerTime ?? (markersSet ? endTime : (vcdEnd ?? endTime));
-    const resolvedStart = Math.min(t0, t1);
-    const resolvedEnd = Math.max(t0, t1);
+    const mainMarker = (state?.markerTime !== null && state?.markerTime !== undefined) ? state.markerTime : null;
+    const altMarker  = (state?.altMarkerTime !== null && state?.altMarkerTime !== undefined) ? state.altMarkerTime : null;
 
-    tracker.log.appendLine(`[WaveformContext] vcdEnd=${vcdEnd}, markersSet=${markersSet}, time range: ${resolvedStart} – ${resolvedEnd}`);
+    let resolvedStart: number;
+    let resolvedEnd: number;
 
-    const transitions = await collectTransitions(uri, signals, resolvedStart, resolvedEnd, stepSize, tracker.log);
+    if (mainMarker !== null && altMarker !== null) {
+        // Both markers set — use as explicit range bounds
+        resolvedStart = Math.min(mainMarker, altMarker);
+        resolvedEnd   = Math.max(mainMarker, altMarker);
+    } else if (mainMarker !== null) {
+        // Only main marker — scan from simulation start up to marker
+        resolvedStart = startTime;
+        resolvedEnd   = mainMarker;
+    } else if (altMarker !== null) {
+        // Only alt marker — scan from simulation start up to marker
+        resolvedStart = startTime;
+        resolvedEnd   = altMarker;
+    } else {
+        // No markers — use full default range with early-exit detection
+        resolvedStart = startTime;
+        resolvedEnd   = vcdEnd ?? endTime;
+    }
+
+    tracker.log.appendLine(`[WaveformContext] mainMarker=${mainMarker}, altMarker=${altMarker}, vcdEnd=${vcdEnd}, time range: ${resolvedStart} – ${resolvedEnd}`);
+
+    const transitions = await collectTransitions(uri, signals, resolvedStart, resolvedEnd, stepSize, tracker.log, signal);
     return { uri, signals, transitions, startTime: resolvedStart, endTime: resolvedEnd };
 }
