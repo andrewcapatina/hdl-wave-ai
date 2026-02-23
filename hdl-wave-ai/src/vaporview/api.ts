@@ -15,12 +15,9 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import * as vscode from 'vscode';
-
-export interface SignalTransition {
-    time: number;
-    signal: string;
-    value: string;
-}
+import { SignalTransition } from '../waveform/vcd';
+import { parseWaveformFile } from '../waveform/fst';
+export { SignalTransition } from '../waveform/vcd';
 
 export interface WaveformContext {
     uri: string;
@@ -243,6 +240,77 @@ export async function collectTransitions(
     return transitions;
 }
 
+/**
+ * Build context by parsing the waveform file directly (FST or VCD).
+ * Returns null if parsing fails — caller falls back to VaporView API polling.
+ */
+async function buildWaveformContextFromFile(
+    uri: string,
+    trackedSignals: string[],
+    mainMarker: number | null,
+    altMarker: number | null,
+    defaultStart: number,
+    defaultEnd: number,
+    log: vscode.OutputChannel,
+    abortSignal?: AbortSignal
+): Promise<WaveformContext | null> {
+    const filePath = vscode.Uri.parse(uri).fsPath;
+    log.appendLine(`[WaveformContext] Parsing file directly: ${filePath}`);
+
+    let parseResult: import('../waveform/vcd').VcdParseResult;
+    try {
+        parseResult = await parseWaveformFile(filePath);
+    } catch (err) {
+        log.appendLine(`[WaveformContext] File parse failed (${err}), falling back to VaporView API`);
+        return null;
+    }
+
+    if (abortSignal?.aborted) { return null; }
+
+    // Resolve time range using markers (same logic as polling path)
+    let resolvedStart: number;
+    let resolvedEnd: number;
+
+    if (mainMarker !== null && altMarker !== null) {
+        resolvedStart = Math.min(mainMarker, altMarker);
+        resolvedEnd   = Math.max(mainMarker, altMarker);
+    } else if (mainMarker !== null) {
+        resolvedStart = defaultStart;
+        resolvedEnd   = mainMarker;
+    } else if (altMarker !== null) {
+        resolvedStart = defaultStart;
+        resolvedEnd   = altMarker;
+    } else {
+        resolvedStart = defaultStart;
+        resolvedEnd   = parseResult.endTime || defaultEnd;
+    }
+
+    // Build a lookup of normalized signal names (strip [N:M] bit ranges)
+    // Tracker:  "tb.count[7:0]"  →  VCD parser:  "tb.count"
+    const normToTracked = new Map<string, string>();
+    for (const sig of trackedSignals) {
+        normToTracked.set(sig.replace(/\[[\d:]+\]$/, ''), sig);
+    }
+
+    // Filter parsed transitions to selected signals and resolved time range
+    const filtered: SignalTransition[] = [];
+    for (const t of parseResult.transitions) {
+        if (t.time < resolvedStart || t.time > resolvedEnd) { continue; }
+        const trackedName = normToTracked.get(t.signal);
+        if (trackedName !== undefined) {
+            filtered.push({ time: t.time, signal: trackedName, value: t.value });
+        }
+    }
+
+    log.appendLine(
+        `[WaveformContext] File parse: ${parseResult.transitions.length} total → ` +
+        `${filtered.length} filtered (t=${resolvedStart}–${resolvedEnd}, ` +
+        `timescale=${parseResult.timescale})`
+    );
+
+    return { uri, signals: trackedSignals, transitions: filtered, startTime: resolvedStart, endTime: resolvedEnd };
+}
+
 export async function buildWaveformContext(
     tracker: SignalTracker,
     startTime: number,
@@ -268,34 +336,41 @@ export async function buildWaveformContext(
     const state = await vscode.commands.executeCommand<{
         markerTime: number | null;
         altMarkerTime: number | null;
-        timeEnd: number | null;    // VaporView may expose VCD end time under one of these names
+        timeEnd: number | null;
         maxTime: number | null;
         totalTime: number | null;
     }>('waveformViewer.getViewerState', { uri });
 
-    // Best available VCD end time — fall back through candidate field names
-    const vcdEnd = state?.timeEnd ?? state?.maxTime ?? state?.totalTime ?? null;
-
     const mainMarker = (state?.markerTime !== null && state?.markerTime !== undefined) ? state.markerTime : null;
     const altMarker  = (state?.altMarkerTime !== null && state?.altMarkerTime !== undefined) ? state.altMarkerTime : null;
+
+    // For FST / VCD files: parse directly — avoids the coarse step-size problem
+    // when VaporView doesn't expose the simulation end time.
+    const lowerUri = uri.toLowerCase();
+    if (lowerUri.endsWith('.fst') || lowerUri.endsWith('.vcd')) {
+        const fileCtx = await buildWaveformContextFromFile(
+            uri, signals, mainMarker, altMarker, startTime, endTime, tracker.log, signal
+        );
+        if (fileCtx) { return fileCtx; }
+        // File parse failed — fall through to VaporView polling
+    }
+
+    // ── VaporView polling fallback (non-FST/VCD or file parse error) ──────────
+    const vcdEnd = state?.timeEnd ?? state?.maxTime ?? state?.totalTime ?? null;
 
     let resolvedStart: number;
     let resolvedEnd: number;
 
     if (mainMarker !== null && altMarker !== null) {
-        // Both markers set — use as explicit range bounds
         resolvedStart = Math.min(mainMarker, altMarker);
         resolvedEnd   = Math.max(mainMarker, altMarker);
     } else if (mainMarker !== null) {
-        // Only main marker — scan from simulation start up to marker
         resolvedStart = startTime;
         resolvedEnd   = mainMarker;
     } else if (altMarker !== null) {
-        // Only alt marker — scan from simulation start up to marker
         resolvedStart = startTime;
         resolvedEnd   = altMarker;
     } else {
-        // No markers — use full default range with early-exit detection
         resolvedStart = startTime;
         resolvedEnd   = vcdEnd ?? endTime;
     }

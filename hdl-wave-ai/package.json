@@ -6,9 +6,9 @@
   },
   "name": "hdl-wave-ai",
   "displayName": "HDL Wave AI",
-  "description": "AI-assisted hardware verification using VaporView waveforms and local or cloud LLMs",
+  "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs",
   "icon": "icon.png",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
@@ -28,10 +28,23 @@
         "title": "HDL Wave AI: Open Chat"
       },
       {
+        "command": "hdl-wave-ai.openChatWithFile",
+        "title": "HDL Wave AI: Analyze Waveform File…"
+      },
+      {
         "command": "hdl-wave-ai.debug",
         "title": "HDL Wave AI: Debug VaporView State"
       }
     ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "hdl-wave-ai.openChatWithFile",
+          "when": "resourceExtname == .fst || resourceExtname == .vcd",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "HDL Wave AI",
       "properties": {

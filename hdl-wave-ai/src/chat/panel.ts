@@ -41,6 +41,8 @@ export class ChatPanel {
     private waveformContextSent = false;   // only send waveform dump once per session
     private currentAbortController: AbortController | undefined;
     private disposables: vscode.Disposable[] = [];
+    /** Pre-parsed context from a file (FST/VCD). When set, VaporView is bypassed. */
+    private preloadedContext: WaveformContext | undefined;
 
     private constructor(panel: vscode.WebviewPanel, tracker: SignalTracker, log: vscode.OutputChannel) {
         this.panel = panel;
@@ -77,6 +79,29 @@ export class ChatPanel {
         return ChatPanel.instance;
     }
 
+    /**
+     * Open a new chat pre-loaded with a parsed waveform file context.
+     * Any existing panel is disposed first so the file context starts fresh.
+     */
+    static createWithFile(ctx: WaveformContext, title: string, tracker: SignalTracker, log: vscode.OutputChannel): ChatPanel {
+        if (ChatPanel.instance) {
+            ChatPanel.instance.panel.dispose();
+            ChatPanel.instance = undefined;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            'hdlWaveAiChat',
+            `HDL Wave AI — ${title}`,
+            vscode.ViewColumn.Beside,
+            { enableScripts: true, retainContextWhenHidden: true }
+        );
+
+        const instance = new ChatPanel(panel, tracker, log);
+        instance.preloadedContext = ctx;
+        ChatPanel.instance = instance;
+        return instance;
+    }
+
     private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number }) {
         if (msg.type === 'stop') {
             this.currentAbortController?.abort();
@@ -108,23 +133,33 @@ export class ChatPanel {
         // Only collect and send waveform + HDL context on the first message of a session
         if (!this.waveformContextSent) {
             let contextBlock = '';
+            let contextSignals: string[] = [];
 
-            this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
-            const waveformCtx: WaveformContext | null = await buildWaveformContext(this.tracker, startTime, endTime, stepSize, signal);
-            this.log.appendLine(`[Chat] Waveform context done: ${waveformCtx ? waveformCtx.transitions.length + ' transitions' : 'null'}`);
+            if (this.preloadedContext) {
+                // ── File mode (FST / VCD parsed directly) ──────────────────
+                this.log.appendLine(`[Chat] Using preloaded file context (${this.preloadedContext.transitions.length} transitions)`);
+                contextBlock += formatWaveformContext(this.preloadedContext, 300);
+                contextSignals = this.preloadedContext.signals;
+            } else {
+                // ── VaporView mode ──────────────────────────────────────────
+                this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
+                const waveformCtx: WaveformContext | null = await buildWaveformContext(this.tracker, startTime, endTime, stepSize, signal);
+                this.log.appendLine(`[Chat] Waveform context done: ${waveformCtx ? waveformCtx.transitions.length + ' transitions' : 'null'}`);
 
-            if (signal.aborted) {
-                this.panel.webview.postMessage({ type: 'stream_end' });
-                this.currentAbortController = undefined;
-                return;
-            }
+                if (signal.aborted) {
+                    this.panel.webview.postMessage({ type: 'stream_end' });
+                    this.currentAbortController = undefined;
+                    return;
+                }
 
-            if (waveformCtx) {
-                contextBlock += formatWaveformContext(waveformCtx, 300);
+                if (waveformCtx) {
+                    contextBlock += formatWaveformContext(waveformCtx, 300);
+                    contextSignals = waveformCtx.signals;
+                }
             }
 
             this.log.appendLine(`[Chat] Collecting HDL context`);
-            const hdlContext = await collectHdlContextSmart(waveformCtx?.signals ?? [], this.log);
+            const hdlContext = await collectHdlContextSmart(contextSignals, this.log);
             this.log.appendLine(`[Chat] HDL context done: ${hdlContext ? hdlContext.length + ' chars' : 'null'}`);
             if (hdlContext) {
                 contextBlock += '\n\n' + hdlContext;
