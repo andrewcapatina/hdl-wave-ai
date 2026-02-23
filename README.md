@@ -1,1 +1,1 @@
-Go to the hdl-wave-ai to see the extenstion's README!
+Go to the hdl-wave-ai folder to see the extenstion's README!
