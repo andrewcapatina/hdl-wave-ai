@@ -19,7 +19,25 @@ export interface LLMMessage {
     content: string;
 }
 
+export interface ToolDefinition {
+    name: string;
+    description: string;
+    /** JSON Schema object describing the parameters */
+    parameters: object;
+}
+
 export interface LLMProvider {
     chat(messages: LLMMessage[]): Promise<string>;
     stream(messages: LLMMessage[], signal?: AbortSignal): AsyncGenerator<string>;
+    /**
+     * Run a tool-use loop: the model calls tools via toolExecutor until it
+     * produces a plain-text final answer, which is returned.
+     * Optional — providers that don't support function calling omit this.
+     */
+    chatWithTools?(
+        messages: LLMMessage[],
+        tools: ToolDefinition[],
+        toolExecutor: (name: string, args: Record<string, unknown>) => string,
+        signal?: AbortSignal
+    ): Promise<string>;
 }

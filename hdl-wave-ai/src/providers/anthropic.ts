@@ -15,7 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import Anthropic from '@anthropic-ai/sdk';
-import { LLMMessage, LLMProvider } from './llm';
+import { LLMMessage, LLMProvider, ToolDefinition } from './llm';
 
 export class AnthropicClient implements LLMProvider {
     private client: Anthropic;
@@ -62,5 +62,59 @@ export class AnthropicClient implements LLMProvider {
                 yield event.delta.text;
             }
         }
+    }
+
+    async chatWithTools(
+        messages: LLMMessage[],
+        tools: ToolDefinition[],
+        toolExecutor: (name: string, args: Record<string, unknown>) => string,
+        signal?: AbortSignal
+    ): Promise<string> {
+        const anthropicTools: Anthropic.Tool[] = tools.map(t => ({
+            name: t.name,
+            description: t.description,
+            input_schema: t.parameters as Anthropic.Tool['input_schema'],
+        }));
+
+        const systemMsg = messages.find(m => m.role === 'system');
+        const msgs: Anthropic.MessageParam[] = messages
+            .filter(m => m.role !== 'system')
+            .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
+
+        for (let round = 0; round < 10; round++) {
+            if (signal?.aborted) { return ''; }
+
+            // Force tool use on first round so the model queries actual data.
+            const toolChoice: Anthropic.MessageCreateParams['tool_choice'] =
+                round === 0 ? { type: 'any' } : { type: 'auto' };
+
+            const response = await this.client.messages.create({
+                model: this.model,
+                max_tokens: 4096,
+                system: systemMsg?.content,
+                messages: msgs,
+                tools: anthropicTools,
+                tool_choice: toolChoice,
+            });
+
+            const toolUseBlocks = response.content.filter(
+                (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
+            );
+
+            if (!toolUseBlocks.length || response.stop_reason === 'end_turn') {
+                const textBlock = response.content.find(b => b.type === 'text');
+                return textBlock?.type === 'text' ? textBlock.text : '';
+            }
+
+            msgs.push({ role: 'assistant', content: response.content });
+
+            const toolResults: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map(b => ({
+                type: 'tool_result' as const,
+                tool_use_id: b.id,
+                content: toolExecutor(b.name, b.input as Record<string, unknown>),
+            }));
+            msgs.push({ role: 'user', content: toolResults });
+        }
+        return 'Tool loop exceeded maximum rounds without a final answer.';
     }
 }

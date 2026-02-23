@@ -8,7 +8,7 @@
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs",
   "icon": "icon.png",
-  "version": "0.0.5",
+  "version": "0.1.0",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
@@ -102,6 +102,11 @@
           "default": 300,
           "minimum": 50,
           "description": "Maximum number of signal transitions to send to the LLM. If the collected transitions exceed this, they are evenly sampled to preserve temporal spread. Increase for larger models with bigger context windows."
+        },
+        "hdlWaveAi.waveform.useToolMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use tool-calling (RAG) mode for waveform analysis. The LLM queries signal data on-demand via tools instead of receiving all transitions upfront. Requires a provider that supports function calling (OpenAI-compatible or Anthropic). Falls back to legacy mode if unsupported."
         },
         "hdlWaveAi.hdl.searchPaths": {
           "type": "array",

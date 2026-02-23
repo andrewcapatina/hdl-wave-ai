@@ -54,6 +54,7 @@ export function activate(context: vscode.ExtensionContext) {
                             transitions: result.transitions,
                             startTime: 0,
                             endTime: result.endTime,
+                            timescale: result.timescale,
                         };
 
                         ChatPanel.createWithFile(ctx, title, tracker, log);

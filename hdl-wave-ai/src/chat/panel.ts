@@ -16,9 +16,11 @@
 */
 import * as vscode from 'vscode';
 import { createProvider } from '../providers/factory';
-import { LLMMessage } from '../providers/llm';
+import { LLMMessage, ToolDefinition } from '../providers/llm';
 import { buildWaveformContext, getActiveDocumentUri, SignalTracker, WaveformContext } from '../vaporview/api';
 import { collectHdlContextSmart } from '../hdl/collector';
+import { WaveformIndex } from '../waveform/vcd';
+import { parseWaveformFile } from '../waveform/fst';
 
 const SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
 
@@ -31,6 +33,50 @@ When answering:
 - Suggest concrete fixes or assertions where appropriate
 - Format signal names and values in backticks`;
 
+const TOOL_SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
+
+You have access to tools to query a waveform database. The list_signals result has already been provided — do NOT call list_signals again.
+
+IMPORTANT RULES:
+- When the user specifies a time range (e.g. "between t=X and t=Y"), you MUST use those EXACT values as t_start and t_end in query_transitions calls. Never substitute your own values.
+- Call query_transitions() on signals of interest to see how they change over time.
+- Use get_value_at() to sample multiple signals at the same timestamp to understand circuit state.
+- Only report conclusions backed by actual data you retrieved from the tools.
+- Do not invent signal names, values, or behavior.`;
+
+const WAVEFORM_TOOLS: ToolDefinition[] = [
+    {
+        name: 'list_signals',
+        description: 'List all signals in the waveform with their transition counts. Call this first to understand what signals are available and how active they are.',
+        parameters: { type: 'object', properties: {}, required: [] },
+    },
+    {
+        name: 'query_transitions',
+        description: 'Get transitions for a specific signal within a time range. Returns timestamp and value for each change. Capped at 150 — narrow the range if truncated. IMPORTANT: use the exact t_start and t_end from the user query.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name as returned by list_signals' },
+                t_start: { type: 'number', description: 'Start timestamp (inclusive). Use the value from the user query.' },
+                t_end: { type: 'number', description: 'End timestamp (inclusive). Use the value from the user query.' },
+            },
+            required: ['signal', 't_start', 't_end'],
+        },
+    },
+    {
+        name: 'get_value_at',
+        description: 'Get the last known value of a signal at or before a specific timestamp.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                time: { type: 'number', description: 'Timestamp to query' },
+            },
+            required: ['signal', 'time'],
+        },
+    },
+];
+
 
 export class ChatPanel {
     private static instance: ChatPanel | undefined;
@@ -38,11 +84,13 @@ export class ChatPanel {
     private readonly history: LLMMessage[] = [];
     private readonly tracker: SignalTracker;
     private readonly log: vscode.OutputChannel;
-    private waveformContextSent = false;   // only send waveform dump once per session
+    private waveformContextSent = false;   // only send waveform dump once per session (non-tool mode)
     private currentAbortController: AbortController | undefined;
     private disposables: vscode.Disposable[] = [];
     /** Pre-parsed context from a file (FST/VCD). When set, VaporView is bypassed. */
     private preloadedContext: WaveformContext | undefined;
+    /** In-memory index for tool-use (RAG) mode. Built lazily on first query. */
+    private waveformIndex: WaveformIndex | undefined;
     /** Signals selected in the picker. undefined = not yet initialised (use all). */
     private selectedSignals: string[] | undefined = undefined;
 
@@ -100,6 +148,7 @@ export class ChatPanel {
 
         const instance = new ChatPanel(panel, tracker, log);
         instance.preloadedContext = ctx;
+        instance.waveformIndex = new WaveformIndex(ctx);
         ChatPanel.instance = instance;
         return instance;
     }
@@ -178,6 +227,7 @@ export class ChatPanel {
 
         const config = vscode.workspace.getConfiguration('hdlWaveAi');
         const stepSize = config.get<number>('waveform.sampleStepSize', 1);
+        const useToolMode = config.get<boolean>('waveform.useToolMode', true);
 
         const startTime = msg.startTime ?? 0;
         const endTime = msg.endTime ?? config.get<number>('waveform.defaultEndTime', 10000);
@@ -190,56 +240,75 @@ export class ChatPanel {
         this.panel.webview.postMessage({ type: 'collecting' });
 
         let userContent = msg.text;
+        const provider = createProvider();
+        const canUseTools = useToolMode && !!provider.chatWithTools;
 
-        // Only collect and send waveform + HDL context on the first message of a session
+        // ── Build waveform index (tool mode) or context block (legacy mode) ──
         if (!this.waveformContextSent) {
-            let contextBlock = '';
             let rawCtx: WaveformContext | null = null;
 
             if (this.preloadedContext) {
-                // ── File mode (FST / VCD parsed directly) ──────────────────
+                // File mode: index already built in createWithFile
                 this.log.appendLine(`[Chat] Using preloaded file context (${this.preloadedContext.transitions.length} transitions)`);
                 rawCtx = this.preloadedContext;
             } else {
-                // ── VaporView mode ──────────────────────────────────────────
+                // VaporView mode: poll signals
                 this.log.appendLine(`[Chat] Building waveform context (t=${startTime}..${endTime}, step=${stepSize})`);
                 rawCtx = await buildWaveformContext(this.tracker, startTime, endTime, stepSize, signal);
-                this.log.appendLine(`[Chat] Waveform context done: ${rawCtx ? rawCtx.transitions.length + ' transitions' : 'null'}`);
+                this.log.appendLine(`[Chat] Waveform context: ${rawCtx ? rawCtx.transitions.length + ' transitions' : 'null'}`);
 
                 if (signal.aborted) {
                     this.panel.webview.postMessage({ type: 'stream_end' });
                     this.currentAbortController = undefined;
                     return;
                 }
+
+                // For tool mode: parse the FULL waveform file so the LLM can
+                // query any time range, not just the marker-filtered subset.
+                if (canUseTools && rawCtx && !this.waveformIndex) {
+                    try {
+                        const filePath = vscode.Uri.parse(rawCtx.uri).fsPath;
+                        this.log.appendLine(`[Chat] Parsing full file for tool index: ${filePath}`);
+                        const fullParse = await parseWaveformFile(filePath);
+                        this.waveformIndex = new WaveformIndex({
+                            ...fullParse,
+                            uri: rawCtx.uri,
+                            startTime: 0,
+                        });
+                        this.log.appendLine(`[Chat] WaveformIndex built from full file: ${this.waveformIndex.signals.length} signals, ${fullParse.transitions.length} transitions`);
+                    } catch (err) {
+                        this.log.appendLine(`[Chat] Full file parse failed, falling back to filtered context: ${err}`);
+                        this.waveformIndex = new WaveformIndex(rawCtx);
+                    }
+                }
             }
 
-            // Apply signal picker selection filter
-            let finalCtx = rawCtx;
-            if (finalCtx && this.selectedSignals !== undefined && this.selectedSignals.length > 0) {
-                const selSet = new Set(this.selectedSignals);
-                finalCtx = {
-                    ...finalCtx,
-                    signals: finalCtx.signals.filter(s => selSet.has(s)),
-                    transitions: finalCtx.transitions.filter(t => selSet.has(t.signal)),
-                };
-                this.log.appendLine(`[Chat] Signal filter applied: ${finalCtx.signals.length}/${rawCtx!.signals.length} signals, ${finalCtx.transitions.length} transitions`);
-            }
+            if (!canUseTools) {
+                // ── Legacy mode: dump transitions into the message ────────────
+                let finalCtx = rawCtx;
+                if (finalCtx && this.selectedSignals !== undefined && this.selectedSignals.length > 0) {
+                    const selSet = new Set(this.selectedSignals);
+                    finalCtx = {
+                        ...finalCtx,
+                        signals: finalCtx.signals.filter(s => selSet.has(s)),
+                        transitions: finalCtx.transitions.filter(t => selSet.has(t.signal)),
+                    };
+                    this.log.appendLine(`[Chat] Signal filter applied: ${finalCtx.signals.length}/${rawCtx!.signals.length} signals`);
+                }
 
-            const contextSignals = finalCtx?.signals ?? [];
-            if (finalCtx) {
-                contextBlock += formatWaveformContext(finalCtx, 300);
-            }
+                let contextBlock = '';
+                if (finalCtx) { contextBlock += formatWaveformContext(finalCtx, 300); }
 
-            this.log.appendLine(`[Chat] Collecting HDL context`);
-            const hdlContext = await collectHdlContextSmart(contextSignals, this.log);
-            this.log.appendLine(`[Chat] HDL context done: ${hdlContext ? hdlContext.length + ' chars' : 'null'}`);
-            if (hdlContext) {
-                contextBlock += '\n\n' + hdlContext;
-            }
+                this.log.appendLine(`[Chat] Collecting HDL context`);
+                const hdlContext = await collectHdlContextSmart(finalCtx?.signals ?? [], this.log);
+                if (hdlContext) { contextBlock += '\n\n' + hdlContext; }
 
-            if (contextBlock) {
-                userContent = `${contextBlock}\n\n---\n\n${msg.text}`;
-                this.waveformContextSent = true;
+                if (contextBlock) {
+                    userContent = `${contextBlock}\n\n---\n\n${msg.text}`;
+                    this.waveformContextSent = true;
+                }
+            } else {
+                this.waveformContextSent = true; // prevent re-collection on follow-ups
             }
         }
 
@@ -256,32 +325,77 @@ export class ChatPanel {
         const conversational = config2.get<boolean>('chat.conversational', true);
         const maxHistory = config2.get<number>('chat.maxHistory', 20);
 
-        const messages: LLMMessage[] = conversational
-            ? [{ role: 'system', content: SYSTEM_PROMPT }, ...this.history.slice(-maxHistory)]
-            : [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }];
-
         try {
-            const provider = createProvider();
             const { marked } = await import('marked');
-            this.log.appendLine(`[Chat] Sending ${messages.length} messages to LLM (streaming)`);
-            this.panel.webview.postMessage({ type: 'stream_start' });
-            let fullResponse = '';
-            for await (const chunk of provider.stream(messages, signal)) {
-                fullResponse += chunk;
-                const html = marked.parse(fullResponse) as string;
-                this.panel.webview.postMessage({ type: 'chunk', text: chunk, html });
+
+            if (canUseTools && this.waveformIndex) {
+                // ── Tool mode: compact summary + tool loop ────────────────────
+                const idx = this.waveformIndex;
+                const selSet = this.selectedSignals !== undefined && this.selectedSignals.length > 0
+                    ? new Set(this.selectedSignals) : null;
+
+                const summary = buildWaveformSummary(idx, selSet);
+                const hdlContext = await collectHdlContextSmart(
+                    selSet ? idx.signals.filter(s => selSet.has(s)) : idx.signals,
+                    this.log
+                );
+                // Extract the user's time range so we can inject it prominently
+                const timeRange = extractTimeRange(msg.text);
+                const rangeHint = timeRange
+                    ? `\n\n## Query Time Range\nThe user is asking about t_start=${timeRange.tStart} to t_end=${timeRange.tEnd}. You MUST use these exact values in query_transitions calls.`
+                    : '';
+                if (timeRange) {
+                    this.log.appendLine(`[Chat] Extracted user time range: ${timeRange.tStart} – ${timeRange.tEnd}`);
+                }
+
+                const contextPrefix = summary + rangeHint + (hdlContext ? '\n\n' + hdlContext : '');
+                const fullUserContent = `${contextPrefix}\n\n---\n\n${msg.text}`;
+
+                // Use full history in conversational mode, but prefix context each time
+                const messages: LLMMessage[] = conversational
+                    ? [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, ...this.history.slice(-(maxHistory - 1)), { role: 'user', content: fullUserContent }]
+                    : [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, { role: 'user', content: fullUserContent }];
+
+                // Replace the history entry (userContent may differ from fullUserContent)
+                this.history[this.history.length - 1] = { role: 'user', content: fullUserContent };
+
+                const executor = buildToolExecutor(idx, selSet, this.log);
+
+                this.log.appendLine(`[Chat] Tool mode: running tool loop`);
+                this.panel.webview.postMessage({ type: 'stream_start' });
+
+                const finalText = await provider.chatWithTools!(messages, WAVEFORM_TOOLS, executor, signal);
+
+                if (finalText) {
+                    const html = marked.parse(finalText) as string;
+                    this.panel.webview.postMessage({ type: 'chunk', text: finalText, html });
+                    this.history.push({ role: 'assistant', content: finalText });
+                }
+                this.panel.webview.postMessage({ type: 'stream_end' });
+
+            } else {
+                // ── Legacy streaming mode ─────────────────────────────────────
+                const messages: LLMMessage[] = conversational
+                    ? [{ role: 'system', content: SYSTEM_PROMPT }, ...this.history.slice(-maxHistory)]
+                    : [{ role: 'system', content: SYSTEM_PROMPT }, { role: 'user', content: userContent }];
+
+                this.log.appendLine(`[Chat] Sending ${messages.length} messages to LLM (streaming)`);
+                this.panel.webview.postMessage({ type: 'stream_start' });
+                let fullResponse = '';
+                for await (const chunk of provider.stream(messages, signal)) {
+                    fullResponse += chunk;
+                    const html = marked.parse(fullResponse) as string;
+                    this.panel.webview.postMessage({ type: 'chunk', text: chunk, html });
+                }
+                if (fullResponse) {
+                    this.history.push({ role: 'assistant', content: fullResponse });
+                }
+                this.panel.webview.postMessage({ type: 'stream_end' });
             }
-            if (fullResponse) {
-                this.history.push({ role: 'assistant', content: fullResponse });
-            }
-            this.panel.webview.postMessage({ type: 'stream_end' });
         } catch (err) {
             if (signal.aborted) {
-                // Roll back the user message so the next query starts clean
                 this.history.pop();
-                if (contextWasJustSent) {
-                    this.waveformContextSent = false;
-                }
+                if (contextWasJustSent) { this.waveformContextSent = false; }
                 this.panel.webview.postMessage({ type: 'stream_end' });
             } else {
                 const errMsg = err instanceof Error ? err.message : String(err);
@@ -299,6 +413,69 @@ export class ChatPanel {
         for (const d of this.disposables) { d.dispose(); }
         this.disposables = [];
     }
+}
+
+function buildWaveformSummary(idx: WaveformIndex, selSet: Set<string> | null): string {
+    const allSignals = idx.listSignals();
+    const signals = selSet ? allSignals.filter(s => selSet.has(s.name)) : allSignals;
+    const top = [...signals].sort((a, b) => b.transitionCount - a.transitionCount).slice(0, 30);
+
+    const lines = [
+        `## Waveform Summary (tool-query mode)`,
+        `File: ${idx.uri}`,
+        `Time range: ${idx.startTime} \u2013 ${idx.endTime} (timescale: ${idx.timescale})`,
+        `Signals available: ${signals.length} — use list_signals() for full list, query_transitions() to fetch data`,
+        ``,
+        `Top signals by activity:`,
+        ...top.map(s => `  ${s.name}: ${s.transitionCount} transitions`),
+        ...(signals.length > 30 ? [`  \u2026 and ${signals.length - 30} more`] : []),
+    ];
+    return lines.join('\n');
+}
+
+function buildToolExecutor(
+    idx: WaveformIndex,
+    selSet: Set<string> | null,
+    log: vscode.OutputChannel
+): (name: string, args: Record<string, unknown>) => string {
+    const TRANSITION_CAP = 150;
+    return (name: string, args: Record<string, unknown>): string => {
+        log.appendLine(`[Chat] Tool call: ${name}(${JSON.stringify(args)})`);
+        switch (name) {
+            case 'list_signals': {
+                const all = idx.listSignals();
+                const signals = selSet ? all.filter(s => selSet.has(s.name)) : all;
+                return JSON.stringify(signals);
+            }
+            case 'query_transitions': {
+                const sig = String(args['signal'] ?? '');
+                const tStart = Number(args['t_start'] ?? 0);
+                const tEnd = Number(args['t_end'] ?? idx.endTime);
+                const result = idx.queryTransitions(sig, tStart, tEnd, TRANSITION_CAP);
+                if (result.length === 0) {
+                    return `No transitions found for "${sig}" in [${tStart}, ${tEnd}].`;
+                }
+                const truncNote = result.length >= TRANSITION_CAP
+                    ? `[Truncated at ${TRANSITION_CAP}. Narrow the range for more detail.]\n` : '';
+                return truncNote + result.map(t => `t=${t.time}: ${t.value}`).join('\n');
+            }
+            case 'get_value_at': {
+                const sig = String(args['signal'] ?? '');
+                const time = Number(args['time'] ?? 0);
+                return `"${sig}" at t=${time}: ${idx.getValueAt(sig, time)}`;
+            }
+            default:
+                return `Unknown tool: ${name}`;
+        }
+    };
+}
+
+function extractTimeRange(text: string): { tStart: number; tEnd: number } | null {
+    const match = text.match(/t\s*=\s*(\d+)[\s\S]*?t\s*=\s*(\d+)/i);
+    if (match) {
+        return { tStart: Number(match[1]), tEnd: Number(match[2]) };
+    }
+    return null;
 }
 
 function formatWaveformContext(ctx: WaveformContext, maxTransitions: number): string {

@@ -25,6 +25,7 @@ export interface WaveformContext {
     transitions: SignalTransition[];
     startTime: number;
     endTime: number;
+    timescale?: string;
 }
 
 // Tracks signals currently displayed in VaporView via events
@@ -315,7 +316,7 @@ async function buildWaveformContextFromFile(
         `timescale=${parseResult.timescale})`
     );
 
-    return { uri, signals: trackedSignals, transitions: filtered, startTime: resolvedStart, endTime: resolvedEnd };
+    return { uri, signals: trackedSignals, transitions: filtered, startTime: resolvedStart, endTime: resolvedEnd, timescale: parseResult.timescale };
 }
 
 export async function buildWaveformContext(
