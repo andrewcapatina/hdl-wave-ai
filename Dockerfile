@@ -1,28 +1,25 @@
-FROM ubuntu:24.04
+# Ollama with CUDA 13.0 support for DGX Spark (GB10)
+#
+# Build:  docker build -t ollama-cuda13 .
+# Run:    docker run -d --runtime=nvidia --gpus all --name ollama \
+#           -p 11434:11434 -v ollama_models:/root/.ollama ollama-cuda13
+#
+FROM nvidia/cuda:13.0.0-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    git \
     ca-certificates \
-    build-essential \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js LTS via NodeSource
-RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - && \
-    apt-get install -y nodejs && \
-    rm -rf /var/lib/apt/lists/*
+# Install Ollama
+RUN curl -fsSL https://ollama.com/install.sh | sh
 
-# Install VSCode extension development tools
-RUN npm install -g \
-    yo \
-    generator-code \
-    @vscode/vsce && \
-    mkdir -p /root/.config && \
-    echo '{}' > /root/.yo-rc-global.json
+EXPOSE 11434
 
-WORKDIR /workspace
+ENV OLLAMA_HOST=0.0.0.0
+ENV NVIDIA_VISIBLE_DEVICES=all
 
-CMD ["/bin/bash"]
+CMD ["ollama", "serve"]

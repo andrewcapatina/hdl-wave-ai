@@ -38,6 +38,11 @@ export interface LLMProvider {
         messages: LLMMessage[],
         tools: ToolDefinition[],
         toolExecutor: (name: string, args: Record<string, unknown>) => string,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onProgress?: (event: ToolProgressEvent) => void,
     ): Promise<string>;
 }
+
+export type ToolProgressEvent =
+    | { type: 'tool_call'; name: string; args: Record<string, unknown> }
+    | { type: 'chunk'; text: string };

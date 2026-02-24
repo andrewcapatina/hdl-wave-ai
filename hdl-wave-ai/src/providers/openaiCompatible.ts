@@ -15,7 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import OpenAI from 'openai';
-import { LLMMessage, LLMProvider, ToolDefinition } from './llm';
+import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './llm';
 
 export class OpenAICompatibleClient implements LLMProvider {
     private client: OpenAI;
@@ -53,7 +53,8 @@ export class OpenAICompatibleClient implements LLMProvider {
         messages: LLMMessage[],
         tools: ToolDefinition[],
         toolExecutor: (name: string, args: Record<string, unknown>) => string,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onProgress?: (event: ToolProgressEvent) => void,
     ): Promise<string> {
         const oaiTools: OpenAI.ChatCompletionTool[] = tools.map(t => ({
             type: 'function' as const,
@@ -145,14 +146,7 @@ export class OpenAICompatibleClient implements LLMProvider {
                 // instead of a natural language analysis. Detect this and re-prompt
                 // without tools to force a proper text response.
                 if (!content.trim() || (content.includes('"name"') && content.includes('"arguments"'))) {
-                    const retry = await this.client.chat.completions.create({
-                        model: this.model,
-                        messages: [...msgs, {
-                            role: 'user' as const,
-                            content: 'Based on all the waveform data above, provide your analysis in plain text. Do not output JSON or tool calls.',
-                        }],
-                    }, { signal });
-                    return retry.choices[0]?.message?.content ?? content;
+                    return await this.streamFinalResponse(msgs, signal, onProgress);
                 }
                 return content;
             }
@@ -160,10 +154,48 @@ export class OpenAICompatibleClient implements LLMProvider {
             for (const tc of message.tool_calls) {
                 let args: Record<string, unknown> = {};
                 try { args = JSON.parse(tc.function.arguments); } catch { /* ignore */ }
+                onProgress?.({ type: 'tool_call', name: tc.function.name, args });
                 const result = toolExecutor(tc.function.name, args);
                 msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
             }
         }
         return 'Tool loop exceeded maximum rounds without a final answer.';
+    }
+
+    /** Stream the final LLM response (after tool calls) and emit chunks via onProgress. */
+    private async streamFinalResponse(
+        msgs: OpenAI.ChatCompletionMessageParam[],
+        signal?: AbortSignal,
+        onProgress?: (event: ToolProgressEvent) => void,
+    ): Promise<string> {
+        const finalMsgs: OpenAI.ChatCompletionMessageParam[] = [...msgs, {
+            role: 'user' as const,
+            content: 'Based on all the waveform data above, provide your analysis in plain text. Do not output JSON or tool calls.',
+        }];
+
+        if (!onProgress) {
+            const resp = await this.client.chat.completions.create({
+                model: this.model,
+                messages: finalMsgs,
+            }, { signal });
+            return resp.choices[0]?.message?.content ?? '';
+        }
+
+        const stream = await this.client.chat.completions.create({
+            model: this.model,
+            messages: finalMsgs,
+            stream: true,
+        }, { signal });
+
+        let full = '';
+        for await (const chunk of stream) {
+            if (signal?.aborted) { break; }
+            const delta = chunk.choices[0]?.delta?.content;
+            if (delta) {
+                full += delta;
+                onProgress({ type: 'chunk', text: delta });
+            }
+        }
+        return full;
     }
 }

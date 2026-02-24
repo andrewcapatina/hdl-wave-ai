@@ -365,11 +365,23 @@ export class ChatPanel {
                 this.log.appendLine(`[Chat] Tool mode: running tool loop`);
                 this.panel.webview.postMessage({ type: 'stream_start' });
 
-                const finalText = await provider.chatWithTools!(messages, WAVEFORM_TOOLS, executor, signal);
+                let streamedText = '';
+                const finalText = await provider.chatWithTools!(messages, WAVEFORM_TOOLS, executor, signal, (event) => {
+                    if (event.type === 'tool_call') {
+                        this.log.appendLine(`[Chat] Tool call: ${event.name}(${JSON.stringify(event.args)})`);
+                    } else if (event.type === 'chunk') {
+                        streamedText += event.text;
+                        const html = marked.parse(streamedText) as string;
+                        this.panel.webview.postMessage({ type: 'chunk', text: event.text, html });
+                    }
+                });
 
-                if (finalText) {
+                if (!streamedText && finalText) {
+                    // Non-streamed response (model replied directly without retry)
                     const html = marked.parse(finalText) as string;
                     this.panel.webview.postMessage({ type: 'chunk', text: finalText, html });
+                }
+                if (finalText) {
                     this.history.push({ role: 'assistant', content: finalText });
                 }
                 this.panel.webview.postMessage({ type: 'stream_end' });

@@ -153,6 +153,7 @@ Add to your `claude_desktop_config.json`:
 | `list_signals` | List all signals with transition counts |
 | `query_transitions` | Get transitions for a signal in a time range (capped at 150) |
 | `get_value_at` | Get the value of a signal at a specific timestamp |
+| `find_hdl_modules` | Search directories for HDL modules ranked by relevance to loaded waveform signals |
 
 ### Example Prompt
 
