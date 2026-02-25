@@ -29,6 +29,9 @@ hljs.registerLanguage('verilog', verilog);
 hljs.registerLanguage('systemverilog', verilog);
 hljs.registerLanguage('sv', verilog);
 
+/** Pattern to detect inline code that looks like Verilog/RTL. */
+const VERILOG_INLINE_RE = /\b(assign|wire|reg|input|output|inout|module|endmodule|always|always_ff|always_comb|posedge|negedge|begin|end|if|else|case|endcase|initial|parameter|localparam|genvar|generate|integer|logic)\b/;
+
 /** Lazily initialize marked with highlight.js integration (ESM dynamic imports). */
 let _marked: any = null;
 async function getMarked(): Promise<{ parse: (src: string) => string }> {
@@ -43,6 +46,17 @@ async function getMarked(): Promise<{ parse: (src: string) => string }> {
                 return hljs.highlight(code, { language: 'verilog' }).value;
             },
         }));
+        marked.use({
+            renderer: {
+                codespan({ text }: { text: string }) {
+                    if (VERILOG_INLINE_RE.test(text)) {
+                        const highlighted = hljs.highlight(text, { language: 'verilog' }).value;
+                        return `<code class="hljs">${highlighted}</code>`;
+                    }
+                    return `<code>${text}</code>`;
+                },
+            },
+        });
         _marked = marked;
     }
     return _marked;

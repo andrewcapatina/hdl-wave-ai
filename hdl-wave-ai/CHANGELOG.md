@@ -4,6 +4,14 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.2] - 2026-02-25
+
+### Added
+- Syntax highlighting for inline RTL code snippets — backtick-quoted Verilog (e.g. `` `assign X = Y ? A : B;` ``) is now highlighted with VS Code Dark+ colors when it contains RTL keywords
+
+### Fixed
+- VaporView `getOpenDocuments` API returning an array instead of an object — caused "No active document found" and empty context on all queries
+
 ## [0.1.1] - 2026-02-24
 
 ### Added

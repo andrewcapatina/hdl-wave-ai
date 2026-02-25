@@ -38,16 +38,18 @@ Built as a companion to the [VaporView](https://marketplace.visualstudio.com/ite
 ### Using a local model via Ollama
 
 ```bash
-# Install Ollama and pull a model
-ollama pull deepseek-coder-v2:16b
+# Install Ollama and pull a model (recommended: deepseek-coder-v2:32b)
+ollama pull deepseek-coder-v2:32b
 ```
+
+**Recommended model:** `deepseek-coder-v2:32b` — best balance of code reasoning, tool-use reliability, and Verilog/SystemVerilog comprehension for local inference. Smaller models (16b and below) work but produce shallower analysis and less reliable tool calling.
 
 Set in VS Code Settings:
 - **Provider** → `openai-compatible`
 - **Openai Compatible: Base Url** → `http://localhost:11434/v1`
-- **Openai Compatible: Model** → `deepseek-coder-v2:16b`
+- **Openai Compatible: Model** → `deepseek-coder-v2:32b`
 
-Or run Ollama via Docker Compose — see the [docker-compose example](https://github.com/andrewcapatina/hdl-wave-ai) in the repo.
+Or run Ollama via Docker — see the [Dockerfile](https://github.com/andrewcapatina/hdl-wave-ai) in the repo for GPU-accelerated setup.
 
 ---
 

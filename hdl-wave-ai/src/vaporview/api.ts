@@ -126,11 +126,19 @@ export class SignalTracker {
 }
 
 export async function getActiveDocumentUri(log: vscode.OutputChannel): Promise<string | null> {
-    const docs = await vscode.commands.executeCommand<{ lastActiveDocument: string }>(
+    const docs = await vscode.commands.executeCommand<unknown>(
         'waveformViewer.getOpenDocuments'
     );
     log.appendLine(`[VaporView] getOpenDocuments: ${JSON.stringify(docs)}`);
-    return docs?.lastActiveDocument ?? null;
+
+    // Handle both formats: array of URIs or object with lastActiveDocument
+    if (Array.isArray(docs) && docs.length > 0) {
+        return String(docs[0]);
+    }
+    if (docs && typeof docs === 'object' && 'lastActiveDocument' in docs) {
+        return (docs as { lastActiveDocument: string }).lastActiveDocument;
+    }
+    return null;
 }
 
 const MAX_SAMPLE_ITERATIONS = 100;
