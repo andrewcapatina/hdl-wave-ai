@@ -21,6 +21,32 @@ import { buildWaveformContext, getActiveDocumentUri, SignalTracker, WaveformCont
 import { collectHdlContextSmart } from '../hdl/collector';
 import { WaveformIndex } from '../waveform/vcd';
 import { parseWaveformFile } from '../waveform/fst';
+import hljs from 'highlight.js/lib/core';
+import verilog from 'highlight.js/lib/languages/verilog';
+
+// Register languages for syntax highlighting in chat
+hljs.registerLanguage('verilog', verilog);
+hljs.registerLanguage('systemverilog', verilog);
+hljs.registerLanguage('sv', verilog);
+
+/** Lazily initialize marked with highlight.js integration (ESM dynamic imports). */
+let _marked: any = null;
+async function getMarked(): Promise<{ parse: (src: string) => string }> {
+    if (!_marked) {
+        const { marked } = await import('marked');
+        const { markedHighlight } = await import('marked-highlight');
+        marked.use(markedHighlight({
+            highlight(code: string, lang: string) {
+                if (lang && hljs.getLanguage(lang)) {
+                    return hljs.highlight(code, { language: lang }).value;
+                }
+                return hljs.highlight(code, { language: 'verilog' }).value;
+            },
+        }));
+        _marked = marked;
+    }
+    return _marked;
+}
 
 const SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
 
@@ -33,16 +59,28 @@ When answering:
 - Suggest concrete fixes or assertions where appropriate
 - Format signal names and values in backticks`;
 
-const TOOL_SYSTEM_PROMPT = `You are an expert hardware verification engineer with deep knowledge of Verilog, SystemVerilog, and digital design.
+const TOOL_SYSTEM_PROMPT = `You are an expert hardware verification engineer analyzing waveform simulations alongside RTL source code.
 
 You have access to tools to query a waveform database. The list_signals result has already been provided — do NOT call list_signals again.
 
-IMPORTANT RULES:
-- When the user specifies a time range (e.g. "between t=X and t=Y"), you MUST use those EXACT values as t_start and t_end in query_transitions calls. Never substitute your own values.
-- Call query_transitions() on signals of interest to see how they change over time.
-- Use get_value_at() to sample multiple signals at the same timestamp to understand circuit state.
-- Only report conclusions backed by actual data you retrieved from the tools.
-- Do not invent signal names, values, or behavior.`;
+TOOL USAGE:
+- When the user specifies a time range, use those EXACT values as t_start and t_end. Never substitute your own.
+- Use query_transitions() to see how signals change over time in the range.
+- Use get_value_at() to sample multiple signals at the same timestamp for a snapshot of circuit state.
+
+ANALYSIS METHODOLOGY:
+1. Identify key timestamps where significant state changes occur (e.g. address jumps, bus transactions, control signal edges).
+2. For each key event, sample related signals at that timestamp to build a complete picture.
+3. Cross-reference observed values against the RTL source — quote the specific Verilog line that explains the behavior.
+4. Decode data values in context: instruction bus values are opcodes, address bus values are memory regions, control signals drive state machines.
+5. Build a narrative of what the circuit is doing over time, not just a list of values.
+
+CITATION REQUIREMENT:
+When referencing RTL behavior, quote the actual Verilog code from the provided HDL source. For example:
+  "The bridge forwards the request because \`assign XDREQ = HIT ? 0 : DDREQ;\` in darkbridge shows that on a cache miss (HIT=0), DDREQ passes through."
+Do NOT paraphrase or invent Verilog code. Only quote lines that appear in the provided HDL source.
+
+Do not invent signal names, values, or behavior. Only report conclusions backed by data from tools.`;
 
 const WAVEFORM_TOOLS: ToolDefinition[] = [
     {
@@ -265,20 +303,27 @@ export class ChatPanel {
 
                 // For tool mode: parse the FULL waveform file so the LLM can
                 // query any time range, not just the marker-filtered subset.
-                if (canUseTools && rawCtx && !this.waveformIndex) {
-                    try {
-                        const filePath = vscode.Uri.parse(rawCtx.uri).fsPath;
-                        this.log.appendLine(`[Chat] Parsing full file for tool index: ${filePath}`);
-                        const fullParse = await parseWaveformFile(filePath);
-                        this.waveformIndex = new WaveformIndex({
-                            ...fullParse,
-                            uri: rawCtx.uri,
-                            startTime: 0,
-                        });
-                        this.log.appendLine(`[Chat] WaveformIndex built from full file: ${this.waveformIndex.signals.length} signals, ${fullParse.transitions.length} transitions`);
-                    } catch (err) {
-                        this.log.appendLine(`[Chat] Full file parse failed, falling back to filtered context: ${err}`);
-                        this.waveformIndex = new WaveformIndex(rawCtx);
+                // Also handles the case where the tracker has no signals yet
+                // (rawCtx is null) — we get the URI from VaporView directly.
+                if (canUseTools && !this.waveformIndex) {
+                    const fileUri = rawCtx?.uri ?? await getActiveDocumentUri(this.log);
+                    if (fileUri) {
+                        try {
+                            const filePath = vscode.Uri.parse(fileUri).fsPath;
+                            this.log.appendLine(`[Chat] Parsing full file for tool index: ${filePath}`);
+                            const fullParse = await parseWaveformFile(filePath);
+                            this.waveformIndex = new WaveformIndex({
+                                ...fullParse,
+                                uri: fileUri,
+                                startTime: 0,
+                            });
+                            this.log.appendLine(`[Chat] WaveformIndex built from full file: ${this.waveformIndex.signals.length} signals, ${fullParse.transitions.length} transitions`);
+                        } catch (err) {
+                            this.log.appendLine(`[Chat] Full file parse failed: ${err}`);
+                            if (rawCtx) {
+                                this.waveformIndex = new WaveformIndex(rawCtx);
+                            }
+                        }
                     }
                 }
             }
@@ -327,7 +372,7 @@ export class ChatPanel {
         const maxHistory = config2.get<number>('chat.maxHistory', 20);
 
         try {
-            const { marked } = await import('marked');
+            const marked = await getMarked();
 
             if (canUseTools && this.waveformIndex) {
                 // ── Tool mode: compact summary + tool loop ────────────────────
@@ -340,13 +385,33 @@ export class ChatPanel {
                     selSet ? idx.signals.filter(s => selSet.has(s)) : idx.signals,
                     this.log
                 );
-                // Extract the user's time range so we can inject it prominently
-                const timeRange = extractTimeRange(msg.text);
+                // Extract the user's time range — prefer explicit values in text,
+                // fall back to VaporView marker positions, then webview msg values.
+                let timeRange = extractTimeRange(msg.text);
+                if (!timeRange) {
+                    // Query VaporView for current marker positions
+                    try {
+                        const viewerState = await vscode.commands.executeCommand<{
+                            markerTime: number | null;
+                            altMarkerTime: number | null;
+                        }>('waveformViewer.getViewerState', { uri: idx.uri });
+                        if (viewerState?.markerTime !== null && viewerState?.markerTime !== undefined
+                            && viewerState?.altMarkerTime !== null && viewerState?.altMarkerTime !== undefined) {
+                            timeRange = {
+                                tStart: Math.min(viewerState.markerTime, viewerState.altMarkerTime),
+                                tEnd: Math.max(viewerState.markerTime, viewerState.altMarkerTime),
+                            };
+                        }
+                    } catch { /* VaporView not available */ }
+                }
+                if (!timeRange && msg.startTime !== undefined && msg.endTime !== undefined) {
+                    timeRange = { tStart: msg.startTime, tEnd: msg.endTime };
+                }
                 const rangeHint = timeRange
                     ? `\n\n## Query Time Range\nThe user is asking about t_start=${timeRange.tStart} to t_end=${timeRange.tEnd}. You MUST use these exact values in query_transitions calls.`
                     : '';
                 if (timeRange) {
-                    this.log.appendLine(`[Chat] Extracted user time range: ${timeRange.tStart} – ${timeRange.tEnd}`);
+                    this.log.appendLine(`[Chat] Time range for query: ${timeRange.tStart} – ${timeRange.tEnd}`);
                 }
 
                 const contextPrefix = summary + rangeHint + (hdlContext ? '\n\n' + hdlContext : '');
@@ -374,7 +439,7 @@ export class ChatPanel {
                         const html = marked.parse(streamedText) as string;
                         this.panel.webview.postMessage({ type: 'chunk', text: event.text, html });
                     }
-                });
+                }, hdlContext ?? undefined);
 
                 if (!streamedText && finalText) {
                     // Non-streamed response (model replied directly without retry)
@@ -605,6 +670,21 @@ function getWebviewHtml(): string {
     padding: 0;
     font-size: inherit;
   }
+  /* highlight.js — VS Code Dark+ colors */
+  .hljs { color: #d4d4d4; }
+  .hljs-keyword, .hljs-tag { color: #569cd6; }
+  .hljs-built_in, .hljs-type { color: #4ec9b0; }
+  .hljs-literal { color: #569cd6; }
+  .hljs-number { color: #b5cea8; }
+  .hljs-string { color: #ce9178; }
+  .hljs-comment, .hljs-quote { color: #6a9955; font-style: italic; }
+  .hljs-variable, .hljs-params, .hljs-attr { color: #9cdcfe; }
+  .hljs-title, .hljs-title.function_ { color: #dcdcaa; }
+  .hljs-symbol { color: #b5cea8; }
+  .hljs-meta { color: #569cd6; }
+  .hljs-regexp { color: #d16969; }
+  .hljs-section, .hljs-name { color: #569cd6; }
+  .hljs-selector-class, .hljs-selector-id { color: #d7ba7d; }
   .message.assistant .bubble table {
     border-collapse: collapse;
     margin: 6px 0;
@@ -892,7 +972,7 @@ function getWebviewHtml(): string {
     bubble.textContent = content;
     div.appendChild(bubble);
     messagesEl.appendChild(div);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    scrollToBottom();
   }
 
   function send() {
@@ -924,6 +1004,15 @@ function getWebviewHtml(): string {
   let streamBubble = null;
   let loadingInterval = null;
   let hasContent = false;
+
+  /** Returns true if the user is scrolled near the bottom (within 80px). */
+  function isNearBottom() {
+    return messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 80;
+  }
+
+  function scrollToBottom() {
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 
   function startLoadingDots(bubble) {
     const states = ['\u25cf', '\u25cf \u25cf', '\u25cf \u25cf \u25cf'];
@@ -958,7 +1047,7 @@ function getWebviewHtml(): string {
       hasContent = false;
       bubble.textContent = 'Collecting waveform context\u2026';
       bubble.style.opacity = '0.6';
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom();
       stopEl.style.display = 'block';
     } else if (msg.type === 'stream_start') {
       // Transition the existing bubble (from collecting) into streaming mode
@@ -975,7 +1064,7 @@ function getWebviewHtml(): string {
       streamBubble.textContent = '';
       hasContent = false;
       startLoadingDots(streamBubble);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom();
       stopEl.style.display = 'block';
     } else if (msg.type === 'chunk') {
       if (streamBubble) {
@@ -985,8 +1074,9 @@ function getWebviewHtml(): string {
           streamBubble.classList.add('rendered');
           hasContent = true;
         }
+        const wasAtBottom = isNearBottom();
         streamBubble.innerHTML = msg.html ?? (streamBubble.innerHTML + msg.text);
-        messagesEl.scrollTop = messagesEl.scrollHeight;
+        if (wasAtBottom) { scrollToBottom(); }
       }
     } else if (msg.type === 'stream_end') {
       if (streamBubble) { stopLoadingDots(streamBubble); }
@@ -1009,7 +1099,7 @@ function getWebviewHtml(): string {
       bubble.textContent = '\u21bb Context refreshed \u2014 next message will re-collect waveform and HDL data.';
       div.appendChild(bubble);
       messagesEl.appendChild(div);
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom();
     } else if (msg.type === 'marker_suggestion') {
       showSuggestionChip(msg.display, msg.query);
     } else if (msg.type === 'clear_suggestions') {

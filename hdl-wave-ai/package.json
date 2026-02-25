@@ -8,7 +8,7 @@
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs. Features tool-use (RAG) mode for large designs and a standalone MCP server for integration with Claude Code, Claude Desktop, and other AI tools.",
   "icon": "icon.png",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
@@ -121,7 +121,7 @@
         },
         "hdlWaveAi.hdl.maxModules": {
           "type": "number",
-          "default": 5,
+          "default": 10,
           "minimum": 1,
           "description": "Maximum number of HDL modules to send to the LLM, ranked by relevance to tracked signals"
         },
@@ -163,7 +163,9 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "highlight.js": "^11.11.1",
     "marked": "^17.0.3",
+    "marked-highlight": "^2.2.3",
     "openai": "^4.96.0",
     "zod": "^3.25.76"
   },

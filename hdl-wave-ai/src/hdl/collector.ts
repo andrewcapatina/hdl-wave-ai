@@ -34,7 +34,7 @@ export async function collectHdlContextSmart(
 ): Promise<string | null> {
     const config = vscode.workspace.getConfiguration('hdlWaveAi');
     const extraPaths = config.get<string[]>('hdl.searchPaths', []);
-    const maxModules = config.get<number>('hdl.maxModules', 5);
+    const maxModules = config.get<number>('hdl.maxModules', 10);
     const maxCharsPerModule = config.get<number>('hdl.maxCharsPerModule', 4000);
 
     log.appendLine(`[HDL] collectHdlContextSmart called with ${signals.length} signals`);
@@ -87,9 +87,15 @@ export async function collectHdlContextSmart(
         return null;
     }
 
-    // Sort by score descending, take top maxModules
+    // Sort by score descending, deduplicate by module name (keep highest), take top maxModules
     scored.sort((a, b) => b.score - a.score);
-    const selected = scored.slice(0, maxModules);
+    const seen = new Set<string>();
+    const deduped = scored.filter(m => {
+        if (seen.has(m.mod.name)) { return false; }
+        seen.add(m.mod.name);
+        return true;
+    });
+    const selected = deduped.slice(0, maxModules);
     log.appendLine(
         `[HDL] Selected ${selected.length}/${scored.length} modules: ` +
         selected.map(m => `${m.mod.name}(${m.score})`).join(', ')

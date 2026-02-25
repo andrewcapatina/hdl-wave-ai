@@ -55,6 +55,7 @@ export class OpenAICompatibleClient implements LLMProvider {
         toolExecutor: (name: string, args: Record<string, unknown>) => string,
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
+        hdlContext?: string,
     ): Promise<string> {
         const oaiTools: OpenAI.ChatCompletionTool[] = tools.map(t => ({
             type: 'function' as const,
@@ -141,14 +142,10 @@ export class OpenAICompatibleClient implements LLMProvider {
             msgs.push(message);
 
             if (!message.tool_calls?.length) {
-                const content = message.content ?? '';
-                // Small models (Ollama) sometimes return tool-call JSON as text
-                // instead of a natural language analysis. Detect this and re-prompt
-                // without tools to force a proper text response.
-                if (!content.trim() || (content.includes('"name"') && content.includes('"arguments"'))) {
-                    return await this.streamFinalResponse(msgs, signal, onProgress);
-                }
-                return content;
+                // Always re-prompt without tools for the final response.
+                // This ensures streaming works AND gives the model a clean
+                // break from tool mode, producing better analysis text.
+                return await this.streamFinalResponse(msgs, signal, onProgress, hdlContext);
             }
 
             for (const tc of message.tool_calls) {
@@ -167,10 +164,36 @@ export class OpenAICompatibleClient implements LLMProvider {
         msgs: OpenAI.ChatCompletionMessageParam[],
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
+        hdlContext?: string,
     ): Promise<string> {
+        const hdlReminder = hdlContext
+            ? `\n\nHere is the HDL source for reference — use it to interpret signal values:\n${hdlContext}`
+            : '';
         const finalMsgs: OpenAI.ChatCompletionMessageParam[] = [...msgs, {
             role: 'user' as const,
-            content: 'Based on all the waveform data above, provide your analysis in plain text. Do not output JSON or tool calls.',
+            content: `Now provide your analysis as plain text (no JSON, no tool calls).${hdlReminder}
+
+Structure your response as follows:
+
+## System Overview
+Briefly identify the design (e.g. CPU architecture, SoC components) based on the HDL modules.
+
+## Key Events Timeline
+For the 3-5 most significant events in the time range:
+- **t=<timestamp>**: Describe what happened and why.
+- Quote the specific RTL line that explains the behavior (e.g. \`assign X = Y ? A : B;\` from module_name).
+- Decode any data values in context (e.g. "0x00050663 on IDATA is a BEQ instruction: opcode=1100011, funct3=000, branch offset=12").
+
+## Signal Correlations
+Explain how signals interact across modules. For each claim, cite the RTL line that creates the dependency.
+
+## Summary
+What is the circuit doing overall during this time window? (e.g. "The CPU is executing a loop that reads from peripheral registers and branches based on the result.")
+
+RULES:
+- Do NOT list raw hex values without explaining what they mean in circuit context.
+- Every RTL reference must be an exact quote from the HDL source provided — never paraphrase or invent code.
+- Focus on depth over breadth: analyze a few events thoroughly rather than many events superficially.`,
         }];
 
         if (!onProgress) {

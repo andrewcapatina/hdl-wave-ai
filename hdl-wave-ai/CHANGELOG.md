@@ -4,6 +4,26 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.1] - 2026-02-24
+
+### Added
+- Syntax highlighting for Verilog/SystemVerilog code blocks in chat (highlight.js with VS Code Dark+ colors)
+- Chat scroll preservation during streaming — scroll up to read earlier messages without being pulled to the bottom
+- Structured output template for LLM responses (System Overview, Key Events Timeline, Signal Correlations, Summary)
+
+### Improved
+- Enhanced system prompts with analysis methodology, RTL citation requirements, and concrete examples
+- HDL context re-injected in the final LLM re-prompt to prevent source from being lost in long conversations
+- VaporView marker fallback for time range extraction when no explicit range is in the query
+- Module deduplication in HDL collector to prevent duplicates from consuming context slots
+- Default `hdl.maxModules` increased from 5 to 10
+- Real-time streaming in tool mode for the final response
+- Waveform index builds from the full VCD file even when the signal tracker is empty
+
+### Fixed
+- Tool mode failing when tracker had 0 signals on initial load
+- Time range not extracted for regular typed queries (only worked for marker suggestion clicks)
+
 ## [0.1.0] - 2026-02-23
 
 ### Added

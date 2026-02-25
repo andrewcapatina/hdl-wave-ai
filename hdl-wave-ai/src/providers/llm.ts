@@ -40,6 +40,7 @@ export interface LLMProvider {
         toolExecutor: (name: string, args: Record<string, unknown>) => string,
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
+        hdlContext?: string,
     ): Promise<string>;
 }
 
