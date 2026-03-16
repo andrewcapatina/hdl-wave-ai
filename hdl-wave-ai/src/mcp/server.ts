@@ -20,6 +20,7 @@ import { z } from "zod";
 import { WaveformIndex } from "../waveform/vcd";
 import { parseWaveformFile } from "../waveform/fst";
 import { findRelevantModules } from "../hdl/parser";
+import { decodeInstruction, initDecoder, IsaName } from "../isa/decoder";
 import * as fs from "fs";
 
 let waveformIndex: WaveformIndex | null = null;
@@ -262,6 +263,25 @@ server.registerTool(
         }
         const note = edges.length >= 150 ? "[Capped at 150.]\n" : "";
         return { content: [{ type: "text" as const, text: `${note}${edge_type} edges for "${signal}":\n` + edges.map(e => `t=${e.time}: ${e.value}`).join("\n") }] };
+    }
+);
+
+// ── decode_instruction ───────────────────────────────────────────────────────
+
+server.registerTool(
+    "decode_instruction",
+    {
+        description: "Decode a raw instruction value into assembly mnemonic and operands. Supports RISC-V, ARM, AArch64, x86, x64, MIPS, PowerPC, SPARC.",
+        inputSchema: {
+            value: z.string().describe("Instruction value (hex string like '0x00050663' or binary)"),
+            isa: z.enum(["rv32", "rv64", "arm", "thumb", "aarch64", "x86", "x64", "mips32", "mips64", "ppc", "ppc64", "sparc"]).describe("Instruction set architecture"),
+            address: z.number().optional().describe("Program counter address for branch target calculation"),
+        },
+    },
+    async ({ value, isa, address }) => {
+        await initDecoder();
+        const decoded = decodeInstruction(value, isa as IsaName, address ?? 0);
+        return { content: [{ type: "text" as const, text: `${decoded.description}  [${decoded.raw}, ${decoded.size} bytes]` }] };
     }
 );
 

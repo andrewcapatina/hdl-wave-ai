@@ -24,6 +24,22 @@ const esbuildProblemMatcherPlugin = {
 };
 
 async function main() {
+	// Plugin to fix ts-capstone's ESM/CJS mismatch:
+	// libcapstone.js uses module.exports but capstone.ts imports it as ESM default.
+	// We inject a default export wrapper so esbuild can resolve it.
+	const capstoneCjsFixPlugin = {
+		name: 'capstone-cjs-fix',
+		setup(build) {
+			build.onLoad({ filter: /ts-capstone[/\\]src[/\\]libcapstone\.js$/ }, async (args) => {
+				const fs = require('fs');
+				let contents = fs.readFileSync(args.path, 'utf8');
+				// Append an ESM-compatible default export
+				contents += '\nexport default LibCapstone;\n';
+				return { contents, loader: 'js' };
+			});
+		},
+	};
+
 	const commonOptions = {
 		bundle: true,
 		format: 'cjs',
@@ -32,7 +48,7 @@ async function main() {
 		sourcesContent: false,
 		platform: 'node',
 		logLevel: 'silent',
-		plugins: [esbuildProblemMatcherPlugin],
+		plugins: [capstoneCjsFixPlugin, esbuildProblemMatcherPlugin],
 	};
 
 	// VSCode extension build

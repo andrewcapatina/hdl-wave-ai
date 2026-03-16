@@ -1,6 +1,6 @@
 # HDL Wave AI
 
-AI-assisted hardware verification for VS Code. Connect your active simulation waveform to an LLM — ask questions about signal behavior, debug logic errors, and cross-reference transitions against your HDL source in natural language.
+AI-assisted hardware verification for VS Code. Connect your active simulation waveform to an LLM — ask questions about signal behavior, debug logic errors, and cross-reference transitions against your HDL source in natural language. Features 11 waveform query tools, multi-ISA instruction decoding (RISC-V, ARM, x86, MIPS, and more via Capstone), and automatic HDL source ranking.
 
 Built as a companion to the [VaporView](https://marketplace.visualstudio.com/items?itemName=lramseyer.vaporview) waveform viewer.
 
@@ -46,7 +46,12 @@ Built as a companion to the [VaporView](https://marketplace.visualstudio.com/ite
 ollama pull deepseek-coder-v2:32b
 ```
 
-**Recommended model:** `deepseek-coder-v2:32b` — best balance of code reasoning, tool-use reliability, and Verilog/SystemVerilog comprehension for local inference. Smaller models (16b and below) work but produce shallower analysis and less reliable tool calling.
+**Recommended models:**
+- `qwen3:32b` — best balance of code reasoning, tool-use reliability, and Verilog/SystemVerilog comprehension
+- `qwen3:8b` — faster (~49 tok/s on DGX Spark) with good quality for interactive use
+- `deepseek-coder-v2:32b` — strong alternative for HDL analysis
+
+Smaller models (8B and below) work but produce shallower analysis and less reliable tool calling.
 
 Set in VS Code Settings:
 - **Provider** → `openai-compatible`
@@ -113,6 +118,40 @@ Add `$dumpfile("output.vcd"); $dumpvars(0, tb);` to your testbench's `initial` b
 For large designs with millions of signal transitions, the extension uses a tool-calling approach instead of dumping all transitions into the LLM context. The LLM receives a compact waveform summary and queries signal data on-demand through tools.
 
 This is enabled by default (`hdlWaveAi.waveform.useToolMode: true`) and works with both Anthropic and OpenAI-compatible providers. If the provider doesn't support tool calling, it falls back to legacy mode automatically.
+
+---
+
+## Instruction Decoding
+
+When analyzing CPU designs, the extension can automatically decode instruction bus values into assembly mnemonics using [Capstone](https://www.capstone-engine.org/) — the same disassembly engine used by Ghidra, IDA Pro, and radare2.
+
+### Supported ISAs
+
+| Setting value | Architecture |
+|---|---|
+| `rv32` | RISC-V 32-bit (RV32IMAC) |
+| `rv64` | RISC-V 64-bit (RV64GC) |
+| `arm` | ARM 32-bit (ARMv7) |
+| `thumb` | ARM Thumb (Thumb-2) |
+| `aarch64` | ARM 64-bit (AArch64 / ARMv8) |
+| `x86` | x86 32-bit (IA-32) |
+| `x64` | x86 64-bit (AMD64) |
+| `mips32` | MIPS 32-bit |
+| `mips64` | MIPS 64-bit |
+| `ppc` / `ppc64` | PowerPC |
+| `sparc` | SPARC |
+
+### Setup
+
+Set `hdlWaveAi.isa` in VS Code Settings to match your design's CPU core (e.g. `rv32` for DarkRISCV). The LLM will automatically call `decode_instruction` on instruction bus values (IDATA, etc.) to get exact opcodes instead of guessing.
+
+### Example
+
+Instead of the model guessing "0x00050663 might be a branch instruction", it now decodes it precisely:
+
+> `BEQ a0, zero, 0xc` — branch if a0 equals zero, target PC+12
+
+This eliminates hex-decoding errors and gives the model accurate program flow information for tracing CPU behavior.
 
 ---
 
@@ -186,13 +225,16 @@ Add to your `claude_desktop_config.json`:
 | `find_pattern` | Find timestamps where a signal has a specific value |
 | `count_transitions` | Count transitions in a range without returning data |
 | `get_edges` | Get only rising/falling edges of a signal |
+| `decode_instruction` | Decode a raw instruction value into assembly (supports RISC-V, ARM, x86, MIPS, etc.) |
 | `find_hdl_modules` | Search directories for HDL modules ranked by relevance to loaded waveform signals |
 
-### Example Prompt
+### Example Prompts
 
 After loading a waveform, try:
 
 > Load the waveform at /path/to/design.vcd, then analyze signal activity between t=4200000 and t=4220000. What instructions is the CPU fetching and are there any anomalies?
+
+> Load /path/to/riscv_soc.vcd and find all HDL modules in /path/to/rtl/. Decode the instructions on the IDATA bus between t=3800000 and t=3900000. Is there a branch misprediction?
 
 ### FST Support
 
@@ -222,6 +264,7 @@ FST files require `fst2vcd` (part of [GTKWave](https://gtkwave.sourceforge.net/)
 | `hdlWaveAi.chat.maxHistory` | `20` | Max messages retained in conversational mode |
 | `hdlWaveAi.prompt.maxTokens` | `28000` | Max prompt tokens before truncation (set below model context limit) |
 | `hdlWaveAi.toolLoop.maxRounds` | `0` (auto) | Max tool-call rounds. 0 = auto from token budget (~maxTokens/2000, clamped 5-30) |
+| `hdlWaveAi.isa` | `none` | ISA for instruction decoding: `rv32`, `rv64`, `arm`, `thumb`, `aarch64`, `x86`, `x64`, `mips32`, `mips64`, `ppc`, `ppc64`, `sparc` |
 
 ### Tuning for larger models
 

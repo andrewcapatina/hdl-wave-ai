@@ -8,7 +8,7 @@
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs. Supports Claude, NVIDIA TRT-LLM (DGX Spark), Ollama, vLLM, and any OpenAI-compatible API. Features tool-use (RAG) mode with 10 waveform query tools and a standalone MCP server.",
   "icon": "icon.png",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
@@ -159,6 +159,27 @@
           "minimum": 0,
           "maximum": 50,
           "description": "Maximum tool-call rounds before forcing a final answer. 0 (default) = auto-calculate from prompt.maxTokens (roughly maxTokens/2000, clamped 5-30). Increase for deeper analysis with larger context models."
+        },
+        "hdlWaveAi.isa": {
+          "type": "string",
+          "enum": ["none", "rv32", "rv64", "arm", "thumb", "aarch64", "x86", "x64", "mips32", "mips64", "ppc", "ppc64", "sparc"],
+          "enumDescriptions": [
+            "No instruction decoding",
+            "RISC-V 32-bit (RV32IMAC)",
+            "RISC-V 64-bit (RV64GC)",
+            "ARM 32-bit (ARMv7)",
+            "ARM Thumb (Thumb-2)",
+            "ARM 64-bit (AArch64 / ARMv8)",
+            "x86 32-bit (IA-32)",
+            "x86 64-bit (AMD64 / x86-64)",
+            "MIPS 32-bit",
+            "MIPS 64-bit",
+            "PowerPC 32-bit",
+            "PowerPC 64-bit",
+            "SPARC"
+          ],
+          "default": "none",
+          "description": "Instruction set architecture for decoding instruction bus values in waveform analysis. Set this to match your design's CPU core."
         }
       }
     }
@@ -185,6 +206,7 @@
     "marked": "^17.0.3",
     "marked-highlight": "^2.2.3",
     "openai": "^4.96.0",
+    "ts-capstone": "^0.1.6",
     "zod": "^3.25.76"
   },
   "devDependencies": {

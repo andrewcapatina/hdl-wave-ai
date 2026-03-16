@@ -21,6 +21,7 @@ import { buildWaveformContext, getActiveDocumentUri, SignalTracker, WaveformCont
 import { collectHdlContextSmart } from '../hdl/collector';
 import { WaveformIndex } from '../waveform/vcd';
 import { parseWaveformFile } from '../waveform/fst';
+import { decodeInstruction, initDecoder, IsaName } from '../isa/decoder';
 import hljs from 'highlight.js/lib/core';
 import verilog from 'highlight.js/lib/languages/verilog';
 
@@ -85,6 +86,7 @@ TOOL USAGE:
 - Use count_transitions() to gauge signal activity BEFORE deciding to fetch data — skip quiet signals.
 - Use get_edges() for clock/enable signals — only returns rising/falling edges, filtering noise.
 - Use query_transitions() as a last resort for bulk data in a range.
+- Use decode_instruction() on any instruction bus value (IDATA, instruction, etc.) to get the exact assembly mnemonic and operands. ALWAYS decode instruction values instead of guessing opcodes.
 
 ANALYSIS METHODOLOGY:
 1. Start with snapshot() at the beginning and end of the time range to see what changed.
@@ -249,6 +251,18 @@ const WAVEFORM_TOOLS: ToolDefinition[] = [
                 edge_type: { type: 'string', enum: ['rising', 'falling', 'any'], description: 'Type of edges to return' },
             },
             required: ['signal', 't_start', 't_end', 'edge_type'],
+        },
+    },
+    {
+        name: 'decode_instruction',
+        description: 'Decode a raw instruction value into assembly. Use this on instruction bus signals (IDATA, instruction, etc.) to understand what opcode the CPU is executing. The ISA is configured in extension settings.',
+        parameters: {
+            type: 'object',
+            properties: {
+                value: { type: 'string', description: 'Instruction value (hex string like "0x00050663" or binary)' },
+                address: { type: 'number', description: 'Optional program counter (PC) address for branch target calculation' },
+            },
+            required: ['value'],
         },
     },
 ];
@@ -423,6 +437,10 @@ export class ChatPanel {
 
         let userContent = msg.text;
         const provider = createProvider();
+
+        // Pre-initialize the instruction decoder (loads WASM) so it's ready
+        // for synchronous tool calls during the tool loop.
+        await initDecoder();
         const canUseTools = useToolMode && !!provider.chatWithTools;
 
         // ── Detect if the active waveform file changed since we last built the index ──
@@ -766,6 +784,17 @@ function buildToolExecutor(
                 if (edges.length === 0) { return `No ${edgeType} edges for "${sig}" in [${tStart}, ${tEnd}].`; }
                 const note = edges.length >= 150 ? `[Capped at 150.]\n` : '';
                 return `${note}${edgeType} edges for "${sig}":\n` + edges.map(e => `t=${e.time}: ${e.value}`).join('\n');
+            }
+            case 'decode_instruction': {
+                const val = String(args['value'] ?? '');
+                const addr = Number(args['address'] ?? 0);
+                const isaConfig = vscode.workspace.getConfiguration('hdlWaveAi');
+                const isa = isaConfig.get<string>('isa', 'none') as IsaName;
+                if (isa === 'none') {
+                    return `Instruction decoding is disabled. Set hdlWaveAi.isa in settings to enable (e.g. "rv32" for RISC-V).`;
+                }
+                const decoded = decodeInstruction(val, isa, addr);
+                return `${decoded.description}  [${decoded.raw}, ${decoded.size} bytes, ISA: ${isa}]`;
             }
             default:
                 return `Unknown tool: ${name}`;

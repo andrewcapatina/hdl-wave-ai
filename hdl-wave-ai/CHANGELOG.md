@@ -4,6 +4,29 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.0] - 2026-03-16
+
+### Added
+- **Multi-ISA instruction decoding** via [Capstone](https://www.capstone-engine.org/) disassembly engine. Supports RISC-V (RV32/RV64), ARM (ARMv7/Thumb/AArch64), x86/x64, MIPS (32/64), PowerPC, and SPARC. The LLM automatically decodes instruction bus values into exact assembly mnemonics instead of guessing opcodes.
+- **`decode_instruction` tool** — available in both the VS Code extension and MCP server. Accepts hex instruction values and returns disassembled output with mnemonic, operands, and branch targets.
+- **`hdlWaveAi.isa` setting** — configure the ISA to match your design's CPU core (e.g. `rv32` for RISC-V, `arm` for ARMv7). Set to `none` to disable.
+- **`snapshot` tool pre-seeding** — the tool loop automatically snapshots all signals at the start and end of the queried time range, giving the model a "before and after" picture before any explicit tool calls.
+- **Three-phase prompt budget enforcement** — measures the actual formatted prompt before each API call and progressively trims: (1) oldest tool history, (2) HDL context modules, (3) user message. Prevents TRT-LLM `max_num_tokens` errors.
+- **Automatic waveform file switching** — detects when the active VaporView file changes and rebuilds the waveform index automatically. Marker suggestion chips carry the file URI for correct cross-file analysis.
+
+### Improved
+- System prompt teaches efficient tool methodology: snapshot for state, find_pattern for searches, get_next/prev_transition for causality, decode_instruction for opcodes
+- Pre-seeded data uses `snapshot` instead of bulk `query_transitions` for 10 signals — cuts initial prompt from ~33K to ~8K tokens
+- Final analysis prompt no longer re-injects HDL context, saving thousands of tokens
+- Token estimation uses conservative `chars / 2.5` ratio for accurate ChatML + JSON budgeting
+- Dynamic tool loop rounds scale with context budget (14 rounds for 28K, up to 30 for 128K+ models)
+
+### Fixed
+- Prompt exceeding `max_num_tokens` on TRT-LLM (32768) across all phases: initial prompt, tool loop rounds, and final analysis
+- Wrong waveform file analyzed after switching between designs in VaporView
+- VaporView `getViewerState` returning stale marker values — now self-tracked from events
+- Suggestion chip showing wrong time range due to `getViewerState` race condition
+
 ## [0.1.5] - 2026-03-16
 
 ### Added
