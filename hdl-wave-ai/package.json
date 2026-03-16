@@ -6,7 +6,7 @@
   },
   "name": "hdl-wave-ai",
   "displayName": "HDL Wave AI",
-  "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs. Features tool-use (RAG) mode for large designs and a standalone MCP server for integration with Claude Code, Claude Desktop, and other AI tools.",
+  "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs. Supports Claude, NVIDIA TRT-LLM (DGX Spark), Ollama, vLLM, and any OpenAI-compatible API. Features tool-use (RAG) mode with 10 waveform query tools and a standalone MCP server.",
   "icon": "icon.png",
   "version": "0.1.4",
   "license": "AGPL-3.0-or-later",

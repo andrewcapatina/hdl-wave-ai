@@ -21,7 +21,11 @@ Built as a companion to the [VaporView](https://marketplace.visualstudio.com/ite
 ## Requirements
 
 - [VaporView](https://marketplace.visualstudio.com/items?itemName=lramseyer.vaporview) — VS Code will prompt you to install it automatically
-- An LLM provider: either an [Anthropic API key](https://console.anthropic.com/) or a locally running [Ollama](https://ollama.com/) instance
+- An LLM provider:
+  - [Anthropic API key](https://console.anthropic.com/) (Claude)
+  - [NVIDIA TRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) (local GPU inference, including DGX Spark)
+  - [Ollama](https://ollama.com/) (local CPU/GPU inference)
+  - Any OpenAI-compatible API (vLLM, NVIDIA NIM, text-generation-inference, etc.)
 
 ---
 
@@ -50,6 +54,27 @@ Set in VS Code Settings:
 - **Openai Compatible: Model** → `deepseek-coder-v2:32b`
 
 Or run Ollama via Docker — see the [Dockerfile](https://github.com/andrewcapatina/hdl-wave-ai) in the repo for GPU-accelerated setup.
+
+### Using NVIDIA TRT-LLM (DGX Spark / local GPU)
+
+TRT-LLM provides high-performance local inference for models like Qwen3-32B-FP4, Nemotron-49B, and others on NVIDIA GPUs.
+
+```bash
+# Start TRT-LLM server (example with Qwen3-32B-FP4)
+docker run --rm -it --gpus all --ipc host --network host \
+    -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+    nvcr.io/nvidia/tensorrt_llm:v1.3.0rc7-trtllm \
+    trtllm-serve nvidia/Qwen3-32B-FP4 --port 8000
+```
+
+Set in VS Code Settings:
+- **Provider** → `openai-compatible`
+- **Openai Compatible: Base Url** → `http://localhost:8000/v1`
+- **Openai Compatible: Model** → `nvidia/Qwen3-32B-FP4`
+- **Openai Compatible: Use Completions Endpoint** → `true` (required for TRT-LLM models where the chat endpoint is broken)
+- **Prompt: Max Tokens** → `28000` (for models served with `max_num_tokens=32768`)
+
+> **Note:** Some TRT-LLM models (e.g. Nemotron NAS, Qwen3) have a broken `/v1/chat/completions` endpoint. Enable the completions endpoint setting to use `/v1/completions` with ChatML formatting instead.
 
 ---
 
@@ -155,6 +180,12 @@ Add to your `claude_desktop_config.json`:
 | `list_signals` | List all signals with transition counts |
 | `query_transitions` | Get transitions for a signal in a time range (capped at 150) |
 | `get_value_at` | Get the value of a signal at a specific timestamp |
+| `get_next_transition` | Get the next transition after a given time (walk forward) |
+| `get_prev_transition` | Get the previous transition before a given time (trace causality) |
+| `snapshot` | Sample all signals at a single timestamp |
+| `find_pattern` | Find timestamps where a signal has a specific value |
+| `count_transitions` | Count transitions in a range without returning data |
+| `get_edges` | Get only rising/falling edges of a signal |
 | `find_hdl_modules` | Search directories for HDL modules ranked by relevance to loaded waveform signals |
 
 ### Example Prompt
@@ -179,15 +210,18 @@ FST files require `fst2vcd` (part of [GTKWave](https://gtkwave.sourceforge.net/)
 | `hdlWaveAi.openaiCompatible.baseUrl` | `http://localhost:11434/v1` | Base URL for OpenAI-compatible API |
 | `hdlWaveAi.openaiCompatible.apiKey` | `ollama` | API key (any string works for Ollama) |
 | `hdlWaveAi.openaiCompatible.model` | `qwen2.5-coder:32b` | Model name |
+| `hdlWaveAi.openaiCompatible.useCompletionsEndpoint` | `false` | Use `/v1/completions` instead of `/v1/chat/completions` (for TRT-LLM, etc.) |
 | `hdlWaveAi.waveform.useToolMode` | `true` | Use tool-calling (RAG) mode for waveform analysis |
 | `hdlWaveAi.waveform.sampleStepSize` | `1` | Time step size for waveform sampling |
 | `hdlWaveAi.waveform.maxTransitions` | `300` | Max transitions sent to the LLM in legacy mode (evenly sampled if exceeded) |
 | `hdlWaveAi.waveform.defaultEndTime` | `10000` | Fallback end time when no VaporView markers are set |
 | `hdlWaveAi.hdl.searchPaths` | `[]` | Extra absolute paths to search for HDL source files |
-| `hdlWaveAi.hdl.maxModules` | `5` | Max HDL modules to include, ranked by relevance |
+| `hdlWaveAi.hdl.maxModules` | `10` | Max HDL modules to include, ranked by relevance |
 | `hdlWaveAi.hdl.maxCharsPerModule` | `4000` | Max characters per module before truncation |
 | `hdlWaveAi.chat.conversational` | `true` | Keep prior exchanges in context |
 | `hdlWaveAi.chat.maxHistory` | `20` | Max messages retained in conversational mode |
+| `hdlWaveAi.prompt.maxTokens` | `28000` | Max prompt tokens before truncation (set below model context limit) |
+| `hdlWaveAi.toolLoop.maxRounds` | `0` (auto) | Max tool-call rounds. 0 = auto from token budget (~maxTokens/2000, clamped 5-30) |
 
 ### Tuning for larger models
 
