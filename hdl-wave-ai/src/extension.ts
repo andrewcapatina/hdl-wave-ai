@@ -92,20 +92,57 @@ export function activate(context: vscode.ExtensionContext) {
     });
 
     // Forward VaporView marker events to the chat panel as prompt suggestions.
-    // The event fires with { uri: UriObject, time: number, units: string } for each
-    // individual marker placement — query getViewerState afterward to get both
-    // markers (main + alt) at once.
+    // getViewerState is unreliable (returns stale values), so we track markers
+    // ourselves from onDidSetMarker events. VaporView fires one event per click
+    // but doesn't indicate primary vs alt — we maintain a two-slot buffer.
+    // Clicks within 200ms are batched as a pair (VaporView sometimes fires two
+    // events for one action); otherwise each click advances the slot.
     const vaporExt = vscode.extensions.getExtension('lramseyer.vaporview');
+    let markerA: number | null = null;   // primary (left-click)
+    let markerB: number | null = null;   // alt (middle-click)
+    let markerUri: string | null = null; // URI of the waveform the markers belong to
+    let nextSlot: 'A' | 'B' = 'A';
+    let lastEventTime = 0;
+    let markerDebounceTimer: ReturnType<typeof setTimeout> | undefined;
     const markerSub = vaporExt?.exports?.onDidSetMarker(
-        async (e: { uri?: { external?: string; fsPath?: string }; time?: number; units?: string }) => {
-            log.appendLine(`[Marker] onDidSetMarker: ${JSON.stringify(e)}`);
-            const uri = e.uri?.external ?? (e.uri?.fsPath ? `file://${e.uri.fsPath}` : undefined);
-            if (!uri) { return; }
-            const state = await vscode.commands.executeCommand<{
-                markerTime: number | null;
-                altMarkerTime: number | null;
-            }>('waveformViewer.getViewerState', { uri });
-            ChatPanel.notifyMarkerSet(state?.markerTime ?? null, state?.altMarkerTime ?? null);
+        (e: { uri?: { external?: string; fsPath?: string }; time?: number; units?: string }) => {
+            if (e.time === undefined || e.time === null) { return; }
+            const eventUri = e.uri?.external ?? (e.uri?.fsPath ? `file://${e.uri.fsPath}` : null);
+            log.appendLine(`[Marker] onDidSetMarker: time=${e.time} uri=${eventUri}`);
+
+            // If the URI changed (user clicked on a different waveform), reset markers
+            if (eventUri && eventUri !== markerUri) {
+                markerA = null;
+                markerB = null;
+                nextSlot = 'A';
+                markerUri = eventUri;
+            }
+
+            const now = Date.now();
+            const elapsed = now - lastEventTime;
+            lastEventTime = now;
+
+            // If two events arrive within 100ms, they're a pair from one VaporView
+            // action — update both slots (the earlier event set slot A, this sets B).
+            if (elapsed < 100 && markerA !== null) {
+                markerB = e.time;
+            } else {
+                // Single click — alternate between A and B slots
+                if (nextSlot === 'A') {
+                    markerA = e.time;
+                    nextSlot = 'B';
+                } else {
+                    markerB = e.time;
+                    nextSlot = 'A';
+                }
+            }
+
+            // Debounce the UI update so rapid clicks settle
+            if (markerDebounceTimer) { clearTimeout(markerDebounceTimer); }
+            markerDebounceTimer = setTimeout(() => {
+                log.appendLine(`[Marker] Tracked: markerA=${markerA}, markerB=${markerB}, uri=${markerUri}`);
+                ChatPanel.notifyMarkerSet(markerA, markerB, markerUri);
+            }, 100);
         }
     );
     if (markerSub) { context.subscriptions.push(markerSub); }

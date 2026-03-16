@@ -4,10 +4,22 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.5] - 2026-03-16
+
+### Added
+- **TRT-LLM / DGX Spark support** — tested with Qwen3-32B-FP4 on NVIDIA DGX Spark (GB10 Blackwell). Works via `/v1/completions` with ChatML formatting
+- **Automatic waveform file switching** — detects when VaporView's active file changes and rebuilds the waveform index. No more stale data when switching between designs
+- **Marker URI tracking** — suggestion chips carry the waveform file URI, ensuring the correct file is analyzed when multiple waveforms are open
+- **Marker event self-tracking** — bypasses VaporView's `getViewerState` (which returns stale values) by tracking marker times directly from `onDidSetMarker` events with debouncing
+
+### Fixed
+- **Wrong file analyzed after switching waveforms** — marker clicks on a second waveform file now correctly rebuild the index from that file instead of reusing the stale index
+- **Suggestion chip not updating** — VaporView `getViewerState` race condition worked around via self-tracking with debounce
+
 ## [0.1.4] - 2026-03-16
 
 ### Added
-- **7 new waveform query tools** for smarter RAG analysis:
+- **7 new waveform query tools** for smarter RAG analysis (10 tools total):
   - `get_next_transition` / `get_prev_transition` — walk through events one at a time instead of bulk queries
   - `snapshot` — sample all signals at a single timestamp (replaces repeated `get_value_at` calls)
   - `find_pattern` — search for specific signal values (e.g. "when does VALID go high?")

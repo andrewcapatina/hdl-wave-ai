@@ -339,7 +339,7 @@ export class ChatPanel {
      * Called from extension.ts when VaporView fires onDidSetMarker.
      * Shows a clickable prompt suggestion in the chat if the panel is open.
      */
-    static notifyMarkerSet(markerTime: number | null, altMarkerTime: number | null): void {
+    static notifyMarkerSet(markerTime: number | null, altMarkerTime: number | null, uri?: string | null): void {
         if (!ChatPanel.instance) { return; }
 
         let display: string;
@@ -362,10 +362,10 @@ export class ChatPanel {
             return;
         }
 
-        ChatPanel.instance.panel.webview.postMessage({ type: 'marker_suggestion', display, query });
+        ChatPanel.instance.panel.webview.postMessage({ type: 'marker_suggestion', display, query, uri: uri ?? undefined });
     }
 
-    private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number }): Promise<void> {
+    private async handleMessage(msg: { type: string; text?: string; startTime?: number; endTime?: number; uri?: string }): Promise<void> {
         if (msg.type === 'stop') {
             this.currentAbortController?.abort();
             return;
@@ -394,10 +394,16 @@ export class ChatPanel {
         }
         // Sent by a suggestion chip click: refresh context then run the query
         if (msg.type === 'marker_query' && msg.text) {
+            const markerFileUri = (msg as { uri?: string }).uri;
+            // If the marker belongs to a different waveform file, force rebuild
+            if (markerFileUri && this.waveformIndex && markerFileUri !== this.waveformIndex.uri) {
+                this.log.appendLine(`[Chat] Marker from different file: ${markerFileUri} (was ${this.waveformIndex.uri}). Rebuilding.`);
+                this.waveformIndex = undefined;
+            }
             this.waveformContextSent = false;
             this.history.splice(0);
-            // Re-dispatch as a normal query so the full collection + LLM path runs
-            return this.handleMessage({ type: 'query', text: msg.text });
+            // Re-dispatch as a normal query, passing the URI so the correct file is parsed
+            return this.handleMessage({ type: 'query', text: msg.text, uri: markerFileUri });
         }
         if (msg.type !== 'query' || !msg.text) { return; }
 
@@ -418,6 +424,17 @@ export class ChatPanel {
         let userContent = msg.text;
         const provider = createProvider();
         const canUseTools = useToolMode && !!provider.chatWithTools;
+
+        // ── Detect if the active waveform file changed since we last built the index ──
+        if (this.waveformIndex && !this.preloadedContext) {
+            const currentUri = await getActiveDocumentUri(this.log);
+            if (currentUri && currentUri !== this.waveformIndex.uri) {
+                this.log.appendLine(`[Chat] Active file changed: ${this.waveformIndex.uri} → ${currentUri}. Rebuilding index.`);
+                this.waveformIndex = undefined;
+                this.waveformContextSent = false;
+                this.history.splice(0);
+            }
+        }
 
         // ── Build waveform index (tool mode) or context block (legacy mode) ──
         if (!this.waveformContextSent) {
@@ -444,7 +461,7 @@ export class ChatPanel {
                 // Also handles the case where the tracker has no signals yet
                 // (rawCtx is null) — we get the URI from VaporView directly.
                 if (canUseTools && !this.waveformIndex) {
-                    const fileUri = rawCtx?.uri ?? await getActiveDocumentUri(this.log);
+                    const fileUri = msg.uri ?? rawCtx?.uri ?? await getActiveDocumentUri(this.log);
                     if (fileUri) {
                         try {
                             const filePath = vscode.Uri.parse(fileUri).fsPath;
@@ -1142,7 +1159,7 @@ function getWebviewHtml(): string {
   }
 
   // ── Suggestion chips ─────────────────────────────────────────────────────
-  function showSuggestionChip(display, query) {
+  function showSuggestionChip(display, query, uri) {
     suggestionsEl.innerHTML = ''; // only one chip at a time
     const chip = document.createElement('div');
     chip.className = 'suggestion-chip';
@@ -1166,7 +1183,7 @@ function getWebviewHtml(): string {
       suggestionsEl.innerHTML = '';
       addMessage('user', query);
       sendEl.disabled = true;
-      vscode.postMessage({ type: 'marker_query', text: query });
+      vscode.postMessage({ type: 'marker_query', text: query, uri: uri });
     });
 
     suggestionsEl.appendChild(chip);
@@ -1309,7 +1326,7 @@ function getWebviewHtml(): string {
       messagesEl.appendChild(div);
       scrollToBottom();
     } else if (msg.type === 'marker_suggestion') {
-      showSuggestionChip(msg.display, msg.query);
+      showSuggestionChip(msg.display, msg.query, msg.uri);
     } else if (msg.type === 'clear_suggestions') {
       suggestionsEl.innerHTML = '';
     } else if (msg.type === 'signals_update') {
