@@ -27,6 +27,24 @@ let waveformIndex: WaveformIndex | null = null;
 
 const TRANSITION_CAP = 150;
 
+/** Pattern matching common instruction bus signal names. */
+const INSTRUCTION_SIGNAL_RE = /\b(inst(r|ruction)?(_s\d+)?|idata\d?|im_data|opcode|ir\b|if_instr|id_instr|rom_byte)\b/i;
+
+/** Auto-decode a signal value if it looks like an instruction bus. */
+function autoDecodeInstruction(signalName: string, value: string): string {
+    if (!INSTRUCTION_SIGNAL_RE.test(signalName)) { return ""; }
+    if (!value || /^[xXzZ]+$/.test(value) || value === "0") { return ""; }
+    const isa = (process.env.HDL_WAVE_ISA ?? "none") as IsaName;
+    if (isa === "none") { return ""; }
+    try {
+        const decoded = decodeInstruction(value, isa, 0);
+        if (decoded.description && !decoded.description.toLowerCase().includes("unknown")) {
+            return ` → ${decoded.description}`;
+        }
+    } catch { /* ignore */ }
+    return "";
+}
+
 const server = new McpServer({
     name: "hdl-wave-ai",
     version: "0.1.0",
@@ -189,7 +207,10 @@ server.registerTool(
             return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
         }
         const snap = waveformIndex.snapshot(time, signals);
-        const text = `Snapshot at t=${time}:\n` + snap.map(s => `  ${s.signal}: ${s.value}`).join("\n");
+        const text = `Snapshot at t=${time}:\n` + snap.map(s => {
+            const decoded = autoDecodeInstruction(s.signal, s.value);
+            return `  ${s.signal}: ${s.value}${decoded}`;
+        }).join("\n");
         return { content: [{ type: "text" as const, text }] };
     }
 );

@@ -709,6 +709,39 @@ function buildWaveformSummary(idx: WaveformIndex, selSet: Set<string> | null): s
     return lines.join('\n');
 }
 
+/** Pattern matching common instruction bus signal names. */
+const INSTRUCTION_SIGNAL_RE = /\b(inst(r|ruction)?(_s\d+)?|idata\d?|im_data|opcode|ir\b|if_instr|id_instr|rom_byte)\b/i;
+
+/** Auto-decode a signal value if it looks like an instruction bus. Returns the annotation or empty string. */
+function autoDecodeInstruction(signalName: string, value: string, log?: vscode.OutputChannel): string {
+    const matches = INSTRUCTION_SIGNAL_RE.test(signalName);
+    if (matches) {
+        log?.appendLine(`[Decode] Matched signal: ${signalName}, value: ${value}`);
+    }
+    if (!matches) { return ''; }
+    // Skip x/z/unknown values
+    if (!value || /^[xXzZ]+$/.test(value) || value === '0') {
+        log?.appendLine(`[Decode] Skipping x/z/0 value for ${signalName}`);
+        return '';
+    }
+    const isaConfig = vscode.workspace.getConfiguration('hdlWaveAi');
+    const isa = isaConfig.get<string>('isa', 'none') as IsaName;
+    log?.appendLine(`[Decode] ISA setting: '${isa}' for ${signalName}`);
+    if (isa === 'none') {
+        return '';
+    }
+    try {
+        const decoded = decodeInstruction(value, isa, 0);
+        log?.appendLine(`[Decode] ${signalName} = ${value} → ${decoded.description} (mnemonic: ${decoded.mnemonic})`);
+        if (decoded.description && !decoded.description.toLowerCase().includes('unknown') && decoded.mnemonic !== 'LOADING' && decoded.mnemonic !== 'ERROR' && decoded.mnemonic !== 'INVALID') {
+            return ` → ${decoded.description}`;
+        }
+    } catch (err) {
+        log?.appendLine(`[Decode] Error decoding ${signalName}=${value}: ${err}`);
+    }
+    return '';
+}
+
 function buildToolExecutor(
     idx: WaveformIndex,
     selSet: Set<string> | null,
@@ -733,31 +766,44 @@ function buildToolExecutor(
                 }
                 const truncNote = result.length >= TRANSITION_CAP
                     ? `[Truncated at ${TRANSITION_CAP}. Narrow the range for more detail.]\n` : '';
-                return truncNote + result.map(t => `t=${t.time}: ${t.value}`).join('\n');
+                const sigName = sig;
+                return truncNote + result.map(t => {
+                    const decoded = autoDecodeInstruction(sigName, t.value);
+                    return `t=${t.time}: ${t.value}${decoded}`;
+                }).join('\n');
             }
             case 'get_value_at': {
                 const sig = String(args['signal'] ?? '');
                 const time = Number(args['time'] ?? 0);
-                return `"${sig}" at t=${time}: ${idx.getValueAt(sig, time)}`;
+                const val = idx.getValueAt(sig, time);
+                const decoded = autoDecodeInstruction(sig, val);
+                return `"${sig}" at t=${time}: ${val}${decoded}`;
             }
             case 'get_next_transition': {
                 const sig = String(args['signal'] ?? '');
                 const afterTime = Number(args['after_time'] ?? 0);
                 const t = idx.getNextTransition(sig, afterTime);
-                return t ? `"${sig}" next transition after t=${afterTime}: t=${t.time} → ${t.value}` : `No more transitions for "${sig}" after t=${afterTime}.`;
+                if (!t) { return `No more transitions for "${sig}" after t=${afterTime}.`; }
+                const decoded = autoDecodeInstruction(sig, t.value);
+                return `"${sig}" next transition after t=${afterTime}: t=${t.time} → ${t.value}${decoded}`;
             }
             case 'get_prev_transition': {
                 const sig = String(args['signal'] ?? '');
                 const beforeTime = Number(args['before_time'] ?? 0);
                 const t = idx.getPrevTransition(sig, beforeTime);
-                return t ? `"${sig}" prev transition before t=${beforeTime}: t=${t.time} → ${t.value}` : `No transitions for "${sig}" before t=${beforeTime}.`;
+                if (!t) { return `No transitions for "${sig}" before t=${beforeTime}.`; }
+                const decoded = autoDecodeInstruction(sig, t.value);
+                return `"${sig}" prev transition before t=${beforeTime}: t=${t.time} → ${t.value}${decoded}`;
             }
             case 'snapshot': {
                 const time = Number(args['time'] ?? 0);
                 const sigNames = args['signals'] as string[] | undefined;
                 const effectiveSignals = sigNames ?? (selSet ? idx.signals.filter(s => selSet.has(s)) : idx.signals);
                 const snap = idx.snapshot(time, effectiveSignals);
-                return `Snapshot at t=${time}:\n` + snap.map(s => `  ${s.signal}: ${s.value}`).join('\n');
+                return `Snapshot at t=${time}:\n` + snap.map(s => {
+                    const decoded = autoDecodeInstruction(s.signal, s.value, log);
+                    return `  ${s.signal}: ${s.value}${decoded}`;
+                }).join('\n');
             }
             case 'find_pattern': {
                 const sig = String(args['signal'] ?? '');
