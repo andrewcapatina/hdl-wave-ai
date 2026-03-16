@@ -143,15 +143,23 @@ When analyzing CPU designs, the extension can automatically decode instruction b
 
 ### Setup
 
-Set `hdlWaveAi.isa` in VS Code Settings to match your design's CPU core (e.g. `rv32` for DarkRISCV). The LLM will automatically call `decode_instruction` on instruction bus values (IDATA, etc.) to get exact opcodes instead of guessing.
+Set `hdlWaveAi.isa` in VS Code Settings to match your design's CPU core (e.g. `rv32` for DarkRISCV, `mips32` for MIPS). Instruction bus signals (`inst`, `IDATA`, `IM_DATA`, `opcode`, etc.) are automatically decoded inline in snapshot and transition results — the model gets exact assembly without needing to call any tool.
 
 ### Example
 
-Instead of the model guessing "0x00050663 might be a branch instruction", it now decodes it precisely:
+Instead of the model guessing "0x00050663 might be a branch instruction", the snapshot output now includes:
 
-> `BEQ a0, zero, 0xc` — branch if a0 equals zero, target PC+12
+```
+cpu_tb.mips1.inst: 0xFFF68693 → addi a3, a3, -1
+darksimv.soc0.bridge0.IDATA: 0x00050663 → beq a0, zero, 0xc
+```
 
-This eliminates hex-decoding errors and gives the model accurate program flow information for tracing CPU behavior.
+The model sees the exact mnemonic, registers, and immediates — eliminating hex-decoding errors and enabling accurate program flow analysis.
+
+### Tested architectures
+
+- **RISC-V** — DarkRISCV SoC (darksocv), instruction fetch pipeline tracing
+- **MIPS** — 5-stage pipelined CPU, instruction decode and ALU operation analysis
 
 ---
 
