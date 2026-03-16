@@ -1,6 +1,6 @@
 # HDL Wave AI
 
-AI-assisted hardware verification for VS Code. Connect your active simulation waveform to an LLM — ask questions about signal behavior, debug logic errors, and cross-reference transitions against your HDL source in natural language. Features 11 waveform query tools, multi-ISA instruction decoding (RISC-V, ARM, x86, MIPS, and more via Capstone), and automatic HDL source ranking.
+AI-assisted hardware verification for VS Code. Connect your active simulation waveform to an LLM — ask questions about signal behavior, debug logic errors, and cross-reference transitions against your HDL source in natural language. Features 10 waveform query tools, multi-ISA instruction decoding (RISC-V, ARM, x86, MIPS, and more via Capstone), and automatic HDL source ranking.
 
 Built as a companion to the [VaporView](https://marketplace.visualstudio.com/items?itemName=lramseyer.vaporview) waveform viewer.
 
