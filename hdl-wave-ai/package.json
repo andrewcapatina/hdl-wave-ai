@@ -8,7 +8,7 @@
   "displayName": "HDL Wave AI",
   "description": "AI-assisted hardware verification using VCD and FST waveforms with local or cloud LLMs. Features tool-use (RAG) mode for large designs and a standalone MCP server for integration with Claude Code, Claude Desktop, and other AI tools.",
   "icon": "icon.png",
-  "version": "0.1.2",
+  "version": "0.1.4",
   "license": "AGPL-3.0-or-later",
   "engines": {
     "vscode": "^1.109.0"
@@ -89,6 +89,11 @@
           "default": "qwen2.5-coder:32b",
           "description": "Model name for OpenAI-compatible API"
         },
+        "hdlWaveAi.openaiCompatible.useCompletionsEndpoint": {
+          "type": "boolean",
+          "default": false,
+          "description": "Use the /v1/completions endpoint instead of /v1/chat/completions. Enable this for TRT-LLM models where the chat endpoint is broken (e.g. Qwen3, Nemotron). Formats prompts as ChatML and parses tool calls from text output."
+        },
         "hdlWaveAi.waveform.defaultEndTime": {
           "type": "number",
           "default": 10000,
@@ -141,6 +146,19 @@
           "type": "boolean",
           "default": true,
           "description": "When true (default), prior exchanges are included up to maxHistory. When false, each query is stateless — exactly 2 messages sent per inquiry (system + user)."
+        },
+        "hdlWaveAi.prompt.maxTokens": {
+          "type": "number",
+          "default": 28000,
+          "minimum": 4000,
+          "description": "Maximum estimated prompt tokens before truncation kicks in. Set below your model's context limit to leave room for output tokens and tool-call overhead. For TRT-LLM with max_num_tokens=32768, use 28000."
+        },
+        "hdlWaveAi.toolLoop.maxRounds": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 50,
+          "description": "Maximum tool-call rounds before forcing a final answer. 0 (default) = auto-calculate from prompt.maxTokens (roughly maxTokens/2000, clamped 5-30). Increase for deeper analysis with larger context models."
         }
       }
     }

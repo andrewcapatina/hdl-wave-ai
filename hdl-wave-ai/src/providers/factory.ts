@@ -29,14 +29,19 @@ export function createProvider(): LLMProvider {
         if (!apiKey) {
             throw new Error('Anthropic API key is not set. Configure hdlWaveAi.anthropic.apiKey in settings.');
         }
-        return new AnthropicClient(apiKey, model);
+        const maxToolRounds = config.get<number>('toolLoop.maxRounds', 0);
+        const maxPromptTokens = config.get<number>('prompt.maxTokens', 28000);
+        return new AnthropicClient(apiKey, model, maxToolRounds, maxPromptTokens);
     }
 
     if (providerType === 'openai-compatible') {
         const baseUrl = config.get<string>('openaiCompatible.baseUrl', 'http://localhost:11434/v1');
         const apiKey = config.get<string>('openaiCompatible.apiKey', 'ollama');
         const model = config.get<string>('openaiCompatible.model', 'qwen2.5-coder:32b');
-        return new OpenAICompatibleClient(baseUrl, apiKey, model);
+        const useCompletions = config.get<boolean>('openaiCompatible.useCompletionsEndpoint', false);
+        const maxPromptTokens = config.get<number>('prompt.maxTokens', 28000);
+        const maxToolRounds = config.get<number>('toolLoop.maxRounds', 0);
+        return new OpenAICompatibleClient(baseUrl, apiKey, model, useCompletions, maxPromptTokens, maxToolRounds);
     }
 
     throw new Error(`Unknown provider: ${providerType}`);

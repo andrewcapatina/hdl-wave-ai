@@ -79,15 +79,21 @@ You have access to tools to query a waveform database. The list_signals result h
 
 TOOL USAGE:
 - When the user specifies a time range, use those EXACT values as t_start and t_end. Never substitute your own.
-- Use query_transitions() to see how signals change over time in the range.
-- Use get_value_at() to sample multiple signals at the same timestamp for a snapshot of circuit state.
+- Use snapshot() to get ALL signal values at a single moment — much more efficient than repeated get_value_at calls.
+- Use get_next_transition() / get_prev_transition() to walk through events one at a time — avoids dumping huge ranges.
+- Use find_pattern() to search for specific values (e.g. "when does VALID go high?") instead of scanning all transitions.
+- Use count_transitions() to gauge signal activity BEFORE deciding to fetch data — skip quiet signals.
+- Use get_edges() for clock/enable signals — only returns rising/falling edges, filtering noise.
+- Use query_transitions() as a last resort for bulk data in a range.
 
 ANALYSIS METHODOLOGY:
-1. Identify key timestamps where significant state changes occur (e.g. address jumps, bus transactions, control signal edges).
-2. For each key event, sample related signals at that timestamp to build a complete picture.
-3. Cross-reference observed values against the RTL source — quote the specific Verilog line that explains the behavior.
-4. Decode data values in context: instruction bus values are opcodes, address bus values are memory regions, control signals drive state machines.
-5. Build a narrative of what the circuit is doing over time, not just a list of values.
+1. Start with snapshot() at the beginning and end of the time range to see what changed.
+2. Use find_pattern() and get_edges() to identify key events (e.g. rising edge of VALID, specific address values).
+3. For each key event, use snapshot() to see the full circuit state at that moment.
+4. Use get_next_transition() / get_prev_transition() to trace causality chains between signals.
+5. Cross-reference observed values against the RTL source — quote the specific Verilog line that explains the behavior.
+6. Decode data values in context: instruction bus values are opcodes, address bus values are memory regions, control signals drive state machines.
+7. Build a narrative of what the circuit is doing over time, not just a list of values.
 
 CITATION REQUIREMENT:
 When referencing RTL behavior, quote the actual Verilog code from the provided HDL source. For example:
@@ -95,6 +101,47 @@ When referencing RTL behavior, quote the actual Verilog code from the provided H
 Do NOT paraphrase or invent Verilog code. Only quote lines that appear in the provided HDL source.
 
 Do not invent signal names, values, or behavior. Only report conclusions backed by data from tools.`;
+
+/** Rough token estimate: ~2.5 chars per token (conservative for ChatML + JSON). */
+function estimateTokens(text: string): number {
+    return Math.ceil(text.length / 2.5);
+}
+
+/** Estimate total tokens for a message array. */
+function estimateMessagesTokens(messages: LLMMessage[]): number {
+    return messages.reduce((sum, m) => sum + estimateTokens(m.content) + 4, 0);
+}
+
+/**
+ * Truncate HDL context to fit within a token budget.
+ * Strategy: progressively drop lowest-scored modules, then truncate remaining modules.
+ */
+function truncateHdlContext(hdlContext: string | null, maxChars: number): string | null {
+    if (!hdlContext || hdlContext.length <= maxChars) { return hdlContext; }
+
+    // Split into header + module blocks
+    const blocks = hdlContext.split(/\n(?=### )/);
+    if (blocks.length <= 1) {
+        return hdlContext.slice(0, maxChars) + '\n// ... (truncated to fit token budget)';
+    }
+
+    const header = blocks[0];
+    let modules = blocks.slice(1);
+
+    // Drop modules from the end (lowest scored) until we fit
+    let result = header + '\n' + modules.join('\n');
+    while (modules.length > 1 && result.length > maxChars) {
+        modules = modules.slice(0, -1);
+        result = header + '\n' + modules.join('\n');
+    }
+
+    // If still too long, truncate the remaining modules
+    if (result.length > maxChars) {
+        result = result.slice(0, maxChars) + '\n// ... (truncated to fit token budget)';
+    }
+
+    return result;
+}
 
 const WAVEFORM_TOOLS: ToolDefinition[] = [
     {
@@ -125,6 +172,83 @@ const WAVEFORM_TOOLS: ToolDefinition[] = [
                 time: { type: 'number', description: 'Timestamp to query' },
             },
             required: ['signal', 'time'],
+        },
+    },
+    {
+        name: 'get_next_transition',
+        description: 'Get the next transition of a signal strictly after a given time. Returns the timestamp and new value. Use this to walk forward through events one at a time.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                after_time: { type: 'number', description: 'Find the first transition after this time' },
+            },
+            required: ['signal', 'after_time'],
+        },
+    },
+    {
+        name: 'get_prev_transition',
+        description: 'Get the previous transition of a signal strictly before a given time. Use this to trace back what caused the current state.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                before_time: { type: 'number', description: 'Find the last transition before this time' },
+            },
+            required: ['signal', 'before_time'],
+        },
+    },
+    {
+        name: 'snapshot',
+        description: 'Sample all tracked signals (or a specified subset) at a single timestamp. Returns the value of every signal at that moment. Much more efficient than calling get_value_at repeatedly.',
+        parameters: {
+            type: 'object',
+            properties: {
+                time: { type: 'number', description: 'Timestamp to snapshot' },
+                signals: { type: 'array', items: { type: 'string' }, description: 'Optional subset of signal names. Omit to sample all tracked signals.' },
+            },
+            required: ['time'],
+        },
+    },
+    {
+        name: 'find_pattern',
+        description: 'Find timestamps where a signal has a specific value (exact or substring match). Returns up to 50 timestamps. Use this for questions like "when does VALID go high?" or "when is ADDR equal to 0xFF?"',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                value: { type: 'string', description: 'Value to search for (exact or substring match, case-insensitive)' },
+                t_start: { type: 'number', description: 'Start timestamp (inclusive)' },
+                t_end: { type: 'number', description: 'End timestamp (inclusive)' },
+            },
+            required: ['signal', 'value', 't_start', 't_end'],
+        },
+    },
+    {
+        name: 'count_transitions',
+        description: 'Count how many transitions a signal has in a time range without returning the data. Use this to gauge signal activity before deciding whether to fetch full transitions.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                t_start: { type: 'number', description: 'Start timestamp (inclusive)' },
+                t_end: { type: 'number', description: 'End timestamp (inclusive)' },
+            },
+            required: ['signal', 't_start', 't_end'],
+        },
+    },
+    {
+        name: 'get_edges',
+        description: 'Get only rising or falling edges of a signal in a time range. Filters out intermediate transitions. Useful for clocks, enables, and other control signals.',
+        parameters: {
+            type: 'object',
+            properties: {
+                signal: { type: 'string', description: 'Full signal name' },
+                t_start: { type: 'number', description: 'Start timestamp (inclusive)' },
+                t_end: { type: 'number', description: 'End timestamp (inclusive)' },
+                edge_type: { type: 'string', enum: ['rising', 'falling', 'any'], description: 'Type of edges to return' },
+            },
+            required: ['signal', 't_start', 't_end', 'edge_type'],
         },
     },
 ];
@@ -362,12 +486,21 @@ export class ChatPanel {
                 if (finalCtx) { contextBlock += formatWaveformContext(finalCtx, 300); }
 
                 this.log.appendLine(`[Chat] Collecting HDL context`);
-                const hdlContext = await collectHdlContextSmart(finalCtx?.signals ?? [], this.log);
+                let hdlContext = await collectHdlContextSmart(finalCtx?.signals ?? [], this.log);
+
+                // Enforce token budget for legacy mode
+                const config3 = vscode.workspace.getConfiguration('hdlWaveAi');
+                const legacyMaxTokens = config3.get<number>('prompt.maxTokens', 28000);
+                const fixedLegacy = estimateTokens(SYSTEM_PROMPT) + estimateTokens(contextBlock) + estimateTokens(msg.text) + 200;
+                const hdlBudgetLegacy = Math.max(0, (legacyMaxTokens - fixedLegacy) * 2.5);
+                hdlContext = truncateHdlContext(hdlContext, hdlBudgetLegacy);
+
                 if (hdlContext) { contextBlock += '\n\n' + hdlContext; }
 
                 if (contextBlock) {
                     userContent = `${contextBlock}\n\n---\n\n${msg.text}`;
                     this.waveformContextSent = true;
+                    this.log.appendLine(`[Chat] Legacy prompt token estimate: ~${estimateTokens(SYSTEM_PROMPT + userContent)} (budget: ${legacyMaxTokens})`);
                 }
             }
         }
@@ -384,6 +517,7 @@ export class ChatPanel {
         const config2 = vscode.workspace.getConfiguration('hdlWaveAi');
         const conversational = config2.get<boolean>('chat.conversational', true);
         const maxHistory = config2.get<number>('chat.maxHistory', 20);
+        const maxPromptTokens = config2.get<number>('prompt.maxTokens', 28000);
 
         try {
             const marked = await getMarked();
@@ -395,7 +529,7 @@ export class ChatPanel {
                     ? new Set(this.selectedSignals) : null;
 
                 const summary = buildWaveformSummary(idx, selSet);
-                const hdlContext = await collectHdlContextSmart(
+                let hdlContext = await collectHdlContextSmart(
                     selSet ? idx.signals.filter(s => selSet.has(s)) : idx.signals,
                     this.log
                 );
@@ -428,13 +562,28 @@ export class ChatPanel {
                     this.log.appendLine(`[Chat] Time range for query: ${timeRange.tStart} – ${timeRange.tEnd}`);
                 }
 
+                // Enforce token budget — shrink HDL context if prompt is too large
+                const fixedTokens = estimateTokens(TOOL_SYSTEM_PROMPT) + estimateTokens(summary) + estimateTokens(rangeHint) + estimateTokens(msg.text) + 200;
+                const hdlBudgetChars = Math.max(0, (maxPromptTokens - fixedTokens) * 2.5);
+                hdlContext = truncateHdlContext(hdlContext, hdlBudgetChars);
+                if (hdlContext && estimateTokens(hdlContext) > (maxPromptTokens - fixedTokens)) {
+                    this.log.appendLine(`[Chat] HDL context truncated to fit token budget (${maxPromptTokens} tokens)`);
+                }
+
                 const contextPrefix = summary + rangeHint + (hdlContext ? '\n\n' + hdlContext : '');
                 const fullUserContent = `${contextPrefix}\n\n---\n\n${msg.text}`;
 
                 // Use full history in conversational mode, but prefix context each time
-                const messages: LLMMessage[] = conversational
+                let messages: LLMMessage[] = conversational
                     ? [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, ...this.history.slice(-(maxHistory - 1)), { role: 'user', content: fullUserContent }]
                     : [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, { role: 'user', content: fullUserContent }];
+
+                // If conversational history pushes us over budget, trim older messages
+                while (messages.length > 3 && estimateMessagesTokens(messages) > maxPromptTokens) {
+                    messages = [messages[0], ...messages.slice(2)];
+                }
+
+                this.log.appendLine(`[Chat] Prompt token estimate: ~${estimateMessagesTokens(messages)} (budget: ${maxPromptTokens})`);
 
                 // Replace the history entry (userContent may differ from fullUserContent)
                 this.history[this.history.length - 1] = { role: 'user', content: fullUserContent };
@@ -555,6 +704,51 @@ function buildToolExecutor(
                 const sig = String(args['signal'] ?? '');
                 const time = Number(args['time'] ?? 0);
                 return `"${sig}" at t=${time}: ${idx.getValueAt(sig, time)}`;
+            }
+            case 'get_next_transition': {
+                const sig = String(args['signal'] ?? '');
+                const afterTime = Number(args['after_time'] ?? 0);
+                const t = idx.getNextTransition(sig, afterTime);
+                return t ? `"${sig}" next transition after t=${afterTime}: t=${t.time} → ${t.value}` : `No more transitions for "${sig}" after t=${afterTime}.`;
+            }
+            case 'get_prev_transition': {
+                const sig = String(args['signal'] ?? '');
+                const beforeTime = Number(args['before_time'] ?? 0);
+                const t = idx.getPrevTransition(sig, beforeTime);
+                return t ? `"${sig}" prev transition before t=${beforeTime}: t=${t.time} → ${t.value}` : `No transitions for "${sig}" before t=${beforeTime}.`;
+            }
+            case 'snapshot': {
+                const time = Number(args['time'] ?? 0);
+                const sigNames = args['signals'] as string[] | undefined;
+                const effectiveSignals = sigNames ?? (selSet ? idx.signals.filter(s => selSet.has(s)) : idx.signals);
+                const snap = idx.snapshot(time, effectiveSignals);
+                return `Snapshot at t=${time}:\n` + snap.map(s => `  ${s.signal}: ${s.value}`).join('\n');
+            }
+            case 'find_pattern': {
+                const sig = String(args['signal'] ?? '');
+                const val = String(args['value'] ?? '');
+                const tStart = Number(args['t_start'] ?? 0);
+                const tEnd = Number(args['t_end'] ?? idx.endTime);
+                const times = idx.findPattern(sig, val, tStart, tEnd);
+                if (times.length === 0) { return `"${sig}" never equals "${val}" in [${tStart}, ${tEnd}].`; }
+                const note = times.length >= 50 ? `[Capped at 50 matches.]\n` : '';
+                return `${note}"${sig}" equals "${val}" at: ${times.map(t => `t=${t}`).join(', ')}`;
+            }
+            case 'count_transitions': {
+                const sig = String(args['signal'] ?? '');
+                const tStart = Number(args['t_start'] ?? 0);
+                const tEnd = Number(args['t_end'] ?? idx.endTime);
+                return `"${sig}" has ${idx.countTransitions(sig, tStart, tEnd)} transitions in [${tStart}, ${tEnd}].`;
+            }
+            case 'get_edges': {
+                const sig = String(args['signal'] ?? '');
+                const tStart = Number(args['t_start'] ?? 0);
+                const tEnd = Number(args['t_end'] ?? idx.endTime);
+                const edgeType = (args['edge_type'] ?? 'any') as 'rising' | 'falling' | 'any';
+                const edges = idx.getEdges(sig, tStart, tEnd, edgeType);
+                if (edges.length === 0) { return `No ${edgeType} edges for "${sig}" in [${tStart}, ${tEnd}].`; }
+                const note = edges.length >= 150 ? `[Capped at 150.]\n` : '';
+                return `${note}${edgeType} edges for "${sig}":\n` + edges.map(e => `t=${e.time}: ${e.value}`).join('\n');
             }
             default:
                 return `Unknown tool: ${name}`;

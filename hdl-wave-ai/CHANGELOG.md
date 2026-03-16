@@ -4,6 +4,31 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.4] - 2026-03-16
+
+### Added
+- **7 new waveform query tools** for smarter RAG analysis:
+  - `get_next_transition` / `get_prev_transition` — walk through events one at a time instead of bulk queries
+  - `snapshot` — sample all signals at a single timestamp (replaces repeated `get_value_at` calls)
+  - `find_pattern` — search for specific signal values (e.g. "when does VALID go high?")
+  - `count_transitions` — gauge signal activity before fetching data
+  - `get_edges` — return only rising/falling edges, filtering clock noise
+- **Completions endpoint support** (`/v1/completions`) for TRT-LLM and other servers where `/v1/chat/completions` is broken. Formats prompts as ChatML with text-based tool call parsing. Enable via `useCompletionsEndpoint` setting.
+- **Prompt token budget** (`prompt.maxTokens` setting, default 28000) — automatically truncates HDL context, chat history, and tool results to fit within model context limits. Three-phase truncation: tool history first, then HDL modules, then user message.
+- **Dynamic tool loop rounds** (`toolLoop.maxRounds` setting) — auto-calculated from token budget (`maxTokens / 2000`, clamped 5-30). Larger context models get more rounds for deeper analysis.
+- New tools registered in both the VS Code extension and the standalone MCP server
+
+### Improved
+- System prompt updated with efficient tool usage methodology: snapshot at range boundaries, find_pattern for targeted searches, get_next/prev_transition for causality tracing
+- Pre-seeded tool data uses `snapshot` at time range boundaries instead of bulk `query_transitions` for 10 signals — dramatically reduces initial prompt size
+- Token estimation uses conservative `chars / 2.5` ratio for accurate ChatML + JSON budgeting
+- Final analysis prompt no longer re-injects HDL context (already in conversation), saving thousands of tokens
+- Tool definitions and results are trimmed from oldest entries when prompt exceeds budget
+
+### Fixed
+- Prompt exceeding `max_num_tokens` on TRT-LLM (32768) — budget enforcement now covers initial prompt assembly, tool loop rounds, and final analysis prompt
+- HDL context sent twice (initial prompt + final re-prompt) doubling token usage
+
 ## [0.1.2] - 2026-02-25
 
 ### Added

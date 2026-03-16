@@ -20,10 +20,14 @@ import { LLMMessage, LLMProvider, ToolDefinition } from './llm';
 export class AnthropicClient implements LLMProvider {
     private client: Anthropic;
     private model: string;
+    private maxToolRounds: number;
 
-    constructor(apiKey: string, model: string) {
+    constructor(apiKey: string, model: string, maxToolRounds = 0, maxPromptTokens = 200000) {
         this.client = new Anthropic({ apiKey });
         this.model = model;
+        this.maxToolRounds = maxToolRounds > 0
+            ? maxToolRounds
+            : Math.max(5, Math.min(30, Math.floor(maxPromptTokens / 2000)));
     }
 
     async chat(messages: LLMMessage[]): Promise<string> {
@@ -81,7 +85,7 @@ export class AnthropicClient implements LLMProvider {
             .filter(m => m.role !== 'system')
             .map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }));
 
-        for (let round = 0; round < 10; round++) {
+        for (let round = 0; round < this.maxToolRounds; round++) {
             if (signal?.aborted) { return ''; }
 
             // Force tool use on first round so the model queries actual data.

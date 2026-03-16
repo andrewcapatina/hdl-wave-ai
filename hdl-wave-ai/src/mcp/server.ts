@@ -126,6 +126,145 @@ server.registerTool(
     }
 );
 
+// ── get_next_transition ──────────────────────────────────────────────────────
+
+server.registerTool(
+    "get_next_transition",
+    {
+        description: "Get the next transition of a signal strictly after a given time. Use to walk forward through events.",
+        inputSchema: {
+            signal: z.string().describe("Full signal name"),
+            after_time: z.number().describe("Find the first transition after this time"),
+        },
+    },
+    async ({ signal, after_time }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        const t = waveformIndex.getNextTransition(signal, after_time);
+        const text = t
+            ? `"${signal}" next after t=${after_time}: t=${t.time} → ${t.value}`
+            : `No more transitions for "${signal}" after t=${after_time}.`;
+        return { content: [{ type: "text" as const, text }] };
+    }
+);
+
+// ── get_prev_transition ──────────────────────────────────────────────────────
+
+server.registerTool(
+    "get_prev_transition",
+    {
+        description: "Get the previous transition of a signal strictly before a given time. Use to trace back causality.",
+        inputSchema: {
+            signal: z.string().describe("Full signal name"),
+            before_time: z.number().describe("Find the last transition before this time"),
+        },
+    },
+    async ({ signal, before_time }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        const t = waveformIndex.getPrevTransition(signal, before_time);
+        const text = t
+            ? `"${signal}" prev before t=${before_time}: t=${t.time} → ${t.value}`
+            : `No transitions for "${signal}" before t=${before_time}.`;
+        return { content: [{ type: "text" as const, text }] };
+    }
+);
+
+// ── snapshot ─────────────────────────────────────────────────────────────────
+
+server.registerTool(
+    "snapshot",
+    {
+        description: "Sample all signals (or a subset) at a single timestamp. Returns every signal's value at that moment.",
+        inputSchema: {
+            time: z.number().describe("Timestamp to snapshot"),
+            signals: z.array(z.string()).optional().describe("Optional subset of signal names"),
+        },
+    },
+    async ({ time, signals }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        const snap = waveformIndex.snapshot(time, signals);
+        const text = `Snapshot at t=${time}:\n` + snap.map(s => `  ${s.signal}: ${s.value}`).join("\n");
+        return { content: [{ type: "text" as const, text }] };
+    }
+);
+
+// ── find_pattern ─────────────────────────────────────────────────────────────
+
+server.registerTool(
+    "find_pattern",
+    {
+        description: "Find timestamps where a signal has a specific value. Returns up to 50 matches.",
+        inputSchema: {
+            signal: z.string().describe("Full signal name"),
+            value: z.string().describe("Value to search for (case-insensitive, substring match)"),
+            t_start: z.number().describe("Start timestamp (inclusive)"),
+            t_end: z.number().describe("End timestamp (inclusive)"),
+        },
+    },
+    async ({ signal, value, t_start, t_end }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        const times = waveformIndex.findPattern(signal, value, t_start, t_end);
+        if (times.length === 0) {
+            return { content: [{ type: "text" as const, text: `"${signal}" never equals "${value}" in [${t_start}, ${t_end}].` }] };
+        }
+        const note = times.length >= 50 ? "[Capped at 50.]\n" : "";
+        return { content: [{ type: "text" as const, text: `${note}"${signal}" = "${value}" at: ${times.map(t => `t=${t}`).join(", ")}` }] };
+    }
+);
+
+// ── count_transitions ────────────────────────────────────────────────────────
+
+server.registerTool(
+    "count_transitions",
+    {
+        description: "Count transitions for a signal in a time range without returning data. Use to gauge activity.",
+        inputSchema: {
+            signal: z.string().describe("Full signal name"),
+            t_start: z.number().describe("Start timestamp"),
+            t_end: z.number().describe("End timestamp"),
+        },
+    },
+    async ({ signal, t_start, t_end }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        return { content: [{ type: "text" as const, text: `"${signal}": ${waveformIndex.countTransitions(signal, t_start, t_end)} transitions in [${t_start}, ${t_end}].` }] };
+    }
+);
+
+// ── get_edges ────────────────────────────────────────────────────────────────
+
+server.registerTool(
+    "get_edges",
+    {
+        description: "Get only rising or falling edges of a signal. Filters intermediate transitions.",
+        inputSchema: {
+            signal: z.string().describe("Full signal name"),
+            t_start: z.number().describe("Start timestamp"),
+            t_end: z.number().describe("End timestamp"),
+            edge_type: z.enum(["rising", "falling", "any"]).describe("Edge type to filter"),
+        },
+    },
+    async ({ signal, t_start, t_end, edge_type }) => {
+        if (!waveformIndex) {
+            return { content: [{ type: "text" as const, text: "No waveform loaded." }] };
+        }
+        const edges = waveformIndex.getEdges(signal, t_start, t_end, edge_type);
+        if (edges.length === 0) {
+            return { content: [{ type: "text" as const, text: `No ${edge_type} edges for "${signal}" in [${t_start}, ${t_end}].` }] };
+        }
+        const note = edges.length >= 150 ? "[Capped at 150.]\n" : "";
+        return { content: [{ type: "text" as const, text: `${note}${edge_type} edges for "${signal}":\n` + edges.map(e => `t=${e.time}: ${e.value}`).join("\n") }] };
+    }
+);
+
 // ── find_hdl_modules ─────────────────────────────────────────────────────────
 
 server.registerTool(

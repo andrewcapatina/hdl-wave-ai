@@ -273,4 +273,87 @@ export class WaveformIndex {
         }
         return result;
     }
+
+    /** Return the first transition for `signal` strictly after `afterTime`, or null. */
+    getNextTransition(signal: string, afterTime: number): SignalTransition | null {
+        const ts = this.bySignal.get(signal) ?? [];
+        let lo = 0, hi = ts.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >> 1;
+            if (ts[mid].time <= afterTime) { lo = mid + 1; }
+            else { hi = mid; }
+        }
+        return lo < ts.length ? ts[lo] : null;
+    }
+
+    /** Return the last transition for `signal` strictly before `beforeTime`, or null. */
+    getPrevTransition(signal: string, beforeTime: number): SignalTransition | null {
+        const ts = this.bySignal.get(signal) ?? [];
+        let lo = 0, hi = ts.length - 1, result: SignalTransition | null = null;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (ts[mid].time < beforeTime) { result = ts[mid]; lo = mid + 1; }
+            else { hi = mid - 1; }
+        }
+        return result;
+    }
+
+    /** Snapshot all (or specified) signals at a single timestamp. */
+    snapshot(time: number, signalNames?: string[]): { signal: string; value: string }[] {
+        const names = signalNames ?? this.signals;
+        return names.map(name => ({ signal: name, value: this.getValueAt(name, time) }));
+    }
+
+    /** Find timestamps where `signal` equals `value` within [tStart, tEnd]. Returns up to `cap` results. */
+    findPattern(signal: string, value: string, tStart: number, tEnd: number, cap = 50): number[] {
+        const ts = this.bySignal.get(signal) ?? [];
+        const results: number[] = [];
+        const valueLower = value.toLowerCase();
+        for (const t of ts) {
+            if (t.time < tStart) { continue; }
+            if (t.time > tEnd) { break; }
+            if (t.value.toLowerCase() === valueLower || t.value.toLowerCase().includes(valueLower)) {
+                results.push(t.time);
+                if (results.length >= cap) { break; }
+            }
+        }
+        return results;
+    }
+
+    /** Count transitions for `signal` in [tStart, tEnd] without returning data. */
+    countTransitions(signal: string, tStart: number, tEnd: number): number {
+        const ts = this.bySignal.get(signal) ?? [];
+        let count = 0;
+        for (const t of ts) {
+            if (t.time < tStart) { continue; }
+            if (t.time > tEnd) { break; }
+            count++;
+        }
+        return count;
+    }
+
+    /** Return only rising or falling edges for a signal in [tStart, tEnd]. */
+    getEdges(signal: string, tStart: number, tEnd: number, edgeType: 'rising' | 'falling' | 'any', cap = 150): SignalTransition[] {
+        const ts = this.bySignal.get(signal) ?? [];
+        const results: SignalTransition[] = [];
+        for (let i = 0; i < ts.length && results.length < cap; i++) {
+            if (ts[i].time < tStart) { continue; }
+            if (ts[i].time > tEnd) { break; }
+            if (edgeType === 'any') {
+                results.push(ts[i]);
+            } else {
+                const prev = i > 0 ? ts[i - 1].value : 'x';
+                const curr = ts[i].value;
+                // For multi-bit: treat non-zero as "1", zero as "0"
+                const prevBit = prev === '0' || prev === 'x' || prev === 'z' || /^0+$/.test(prev) ? 0 : 1;
+                const currBit = curr === '0' || curr === 'x' || curr === 'z' || /^0+$/.test(curr) ? 0 : 1;
+                if (edgeType === 'rising' && prevBit === 0 && currBit === 1) {
+                    results.push(ts[i]);
+                } else if (edgeType === 'falling' && prevBit === 1 && currBit === 0) {
+                    results.push(ts[i]);
+                }
+            }
+        }
+        return results;
+    }
 }
