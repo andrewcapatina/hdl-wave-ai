@@ -38,10 +38,25 @@ export class SignalTracker {
     /** Fires whenever signals are added or removed for any VaporView document. */
     readonly onSignalsChanged = this._onSignalsChanged.event;
 
+    private subscribed = false;
+
     constructor(log: vscode.OutputChannel) {
         this.log = log;
         this.subscribeToEvents();
         this.disposables.push(this._onSignalsChanged);
+
+        // If VaporView wasn't active yet, retry when it activates
+        if (!this.subscribed) {
+            const ext = vscode.extensions.getExtension('lramseyer.vaporview');
+            if (ext && !ext.isActive) {
+                this.log.appendLine('[Tracker] VaporView not active yet, waiting for activation...');
+                Promise.resolve(ext.activate()).then(() => {
+                    this.log.appendLine('[Tracker] VaporView activated, subscribing to events');
+                    this.subscribeToEvents();
+                    this.initialize();
+                }).catch(() => { /* ignore */ });
+            }
+        }
     }
 
     private uriKey(uri: string | vscode.Uri | { fsPath?: string }): string {
@@ -51,10 +66,17 @@ export class SignalTracker {
     }
 
     private subscribeToEvents() {
-        const addDisposable = vscode.extensions
-            .getExtension('lramseyer.vaporview')
-            ?.exports
-            ?.onDidAddVariable((e: { uri: string | { external?: string; fsPath?: string }; instancePath: string }) => {
+        if (this.subscribed) { return; }
+        const exports = vscode.extensions.getExtension('lramseyer.vaporview')?.exports;
+        if (!exports?.onDidAddVariable) {
+            this.log.appendLine('[Tracker] VaporView exports not available yet');
+            return;
+        }
+        this.subscribed = true;
+        this.log.appendLine('[Tracker] Subscribed to VaporView events');
+
+        const addDisposable = exports
+            .onDidAddVariable((e: { uri: string | { external?: string; fsPath?: string }; instancePath: string }) => {
                 this.log.appendLine(`[VaporView] onDidAddVariable: ${JSON.stringify(e)}`);
                 const key = this.uriKey(e.uri);
                 if (!this.signals.has(key)) {
@@ -64,10 +86,8 @@ export class SignalTracker {
                 this._onSignalsChanged.fire({ uri: key, signals: Array.from(this.signals.get(key)!) });
             });
 
-        const removeDisposable = vscode.extensions
-            .getExtension('lramseyer.vaporview')
-            ?.exports
-            ?.onDidRemoveVariable((e: { uri: string | { external?: string; fsPath?: string }; instancePath: string }) => {
+        const removeDisposable = exports
+            .onDidRemoveVariable((e: { uri: string | { external?: string; fsPath?: string }; instancePath: string }) => {
                 this.log.appendLine(`[VaporView] onDidRemoveVariable: ${JSON.stringify(e)}`);
                 const key = this.uriKey(e.uri);
                 this.signals.get(key)?.delete(e.instancePath);

@@ -97,14 +97,17 @@ export function activate(context: vscode.ExtensionContext) {
     // but doesn't indicate primary vs alt — we maintain a two-slot buffer.
     // Clicks within 200ms are batched as a pair (VaporView sometimes fires two
     // events for one action); otherwise each click advances the slot.
-    const vaporExt = vscode.extensions.getExtension('lramseyer.vaporview');
     let markerA: number | null = null;   // primary (left-click)
     let markerB: number | null = null;   // alt (middle-click)
     let markerUri: string | null = null; // URI of the waveform the markers belong to
     let nextSlot: 'A' | 'B' = 'A';
     let lastEventTime = 0;
     let markerDebounceTimer: ReturnType<typeof setTimeout> | undefined;
-    const markerSub = vaporExt?.exports?.onDidSetMarker(
+
+    function subscribeToMarkers(): vscode.Disposable | undefined {
+        const vaporExt = vscode.extensions.getExtension('lramseyer.vaporview');
+        if (!vaporExt?.exports?.onDidSetMarker) { return undefined; }
+        return vaporExt.exports.onDidSetMarker(
         (e: { uri?: { external?: string; fsPath?: string }; time?: number; units?: string }) => {
             if (e.time === undefined || e.time === null) { return; }
             const eventUri = e.uri?.external ?? (e.uri?.fsPath ? `file://${e.uri.fsPath}` : null);
@@ -144,7 +147,20 @@ export function activate(context: vscode.ExtensionContext) {
                 ChatPanel.notifyMarkerSet(markerA, markerB, markerUri);
             }, 100);
         }
-    );
+        );
+    }
+
+    let markerSub = subscribeToMarkers();
+    if (!markerSub) {
+        // VaporView not active yet — retry when it activates
+        const vaporExt = vscode.extensions.getExtension('lramseyer.vaporview');
+        if (vaporExt && !vaporExt.isActive) {
+            Promise.resolve(vaporExt.activate()).then(() => {
+                markerSub = subscribeToMarkers();
+                if (markerSub) { context.subscriptions.push(markerSub); }
+            }).catch(() => { /* ignore */ });
+        }
+    }
     if (markerSub) { context.subscriptions.push(markerSub); }
 
     context.subscriptions.push(openChat, openChatWithFile, debug, tracker, log);

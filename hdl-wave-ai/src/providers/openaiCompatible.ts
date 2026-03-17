@@ -17,6 +17,40 @@
 import OpenAI from 'openai';
 import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './llm';
 
+const FINAL_ANALYSIS_PROMPT = `Now provide your final analysis using ONLY the data you gathered from tool calls. No more tool calls.
+
+## System Overview
+One paragraph: what is this design? (CPU arch, SoC components, bus structure)
+
+## Instruction Trace
+Build a table from the IDATA/inst transitions you queried. Use the auto-decoded assembly from the tool results.
+Include ALL instructions you found — do not skip any.
+
+| Time | PC (IADDR) | Hex | Assembly | What it does |
+|------|-----------|-----|----------|-------------|
+| ... | ... | ... | ... | ... |
+
+## Key Events
+Pick 3-5 important moments from the trace above (branches taken, memory accesses, stalls).
+For each event:
+- What happened and WHY (not just what signal changed)
+- Quote the exact RTL line from the HDL source that explains it
+- Connect it to the instruction being executed
+
+## Data Bus Activity
+Summarize memory reads/writes from XADDR, XATAO, DADDR transitions:
+- What addresses were accessed?
+- Were they reads or writes? (XRD/XWR)
+- What data was transferred?
+
+## Summary
+2-3 sentences: What is the CPU doing in plain English? (e.g. "polling a UART status register in a loop, then writing a character")
+
+RULES:
+- Use the decoded assembly from tool results — do NOT re-decode hex values yourself.
+- Every RTL citation must be an exact quote from the provided HDL source.
+- If you did not query a signal, do NOT guess its value.`;
+
 export class OpenAICompatibleClient implements LLMProvider {
     private client: OpenAI;
     private model: string;
@@ -241,7 +275,9 @@ export class OpenAICompatibleClient implements LLMProvider {
             msgs.unshift({ role: 'system', content: this.formatToolsForPrompt(tools) });
         }
 
-        // Pre-execute list_signals and inject as context
+        // Pre-execute list_signals so the model knows what's available.
+        // Do NOT pre-seed snapshots — let the model make its own tool calls
+        // to encourage deeper investigation instead of short-circuiting to analysis.
         const listResult = toolExecutor('list_signals', {});
         const toolHistory: { role: string; name?: string; content: string }[] = [];
         toolHistory.push({
@@ -250,29 +286,14 @@ export class OpenAICompatibleClient implements LLMProvider {
         });
         toolHistory.push({ role: 'tool', name: 'list_signals', content: listResult });
 
-        // Pre-seed: use snapshot at range boundaries instead of bulk query_transitions.
-        // This is far more token-efficient and gives the model a good starting picture.
-        const userMsg = [...messages].reverse().find(m => m.role === 'user');
-        const rangeMatch = userMsg?.content.match(/t_start=(\d+)[\s\S]*?t_end=(\d+)/);
-        if (rangeMatch) {
-            const tStart = Number(rangeMatch[1]);
-            const tEnd = Number(rangeMatch[2]);
-
-            // Snapshot at start and end of range
-            const startSnap = toolExecutor('snapshot', { time: tStart });
-            const endSnap = toolExecutor('snapshot', { time: tEnd });
-            toolHistory.push({
-                role: 'assistant',
-                content: `<tool_call>\n{"name": "snapshot", "arguments": {"time": ${tStart}}}\n</tool_call>\n<tool_call>\n{"name": "snapshot", "arguments": {"time": ${tEnd}}}\n</tool_call>`,
-            });
-            toolHistory.push({ role: 'tool', name: 'snapshot', content: startSnap });
-            toolHistory.push({ role: 'tool', name: 'snapshot', content: endSnap });
-        }
-
         // Token budget: leave room for output (4096) + overhead
         const maxPromptTokens = this.maxPromptTokens - 4096;
 
-        // Tool loop
+        // Tool loop — force tool use for first few rounds
+        const minForcedRounds = Math.min(3, this.maxToolRounds);
+        let totalToolCalls = 0;
+        const queriedSignals = new Set<string>();
+
         for (let round = 0; round < this.maxToolRounds; round++) {
             if (signal?.aborted) { return ''; }
 
@@ -291,18 +312,56 @@ export class OpenAICompatibleClient implements LLMProvider {
             const toolCalls = this.parseToolCalls(text);
 
             if (toolCalls.length === 0) {
+                if (round < minForcedRounds) {
+                    // Model tried to stop too early — nudge it to keep going
+                    toolHistory.push({
+                        role: 'assistant',
+                        content: text || 'I need to gather more data before analyzing.',
+                    });
+                    toolHistory.push({
+                        role: 'tool',
+                        name: 'system',
+                        content: `[You have only made ${totalToolCalls} tool calls. Please make more calls before writing your analysis. Try snapshot(), query_transitions() on control signals, or decode_instruction().]`,
+                    });
+                    continue;
+                }
                 // No tool calls — this is the final response.
                 // Fit before final response too
                 this.fitPromptToBudget(msgs, toolHistory, maxPromptTokens);
                 return await this.streamFinalResponseCompletions(msgs, toolHistory, signal, onProgress, hdlContext);
             }
 
+            // Deduplicate tool calls (small models often repeat the same call)
+            const seen = new Set<string>();
+            const uniqueCalls = toolCalls.filter(tc => {
+                const key = JSON.stringify({ n: tc.name, a: tc.arguments });
+                if (seen.has(key)) { return false; }
+                seen.add(key);
+                return true;
+            });
+
             // Execute tool calls
             toolHistory.push({ role: 'assistant', content: text });
-            for (const tc of toolCalls) {
+            for (const tc of uniqueCalls) {
                 onProgress?.({ type: 'tool_call', name: tc.name, args: tc.arguments });
                 const result = toolExecutor(tc.name, tc.arguments);
                 toolHistory.push({ role: 'tool', name: tc.name, content: result });
+                // Track queried signals
+                if (tc.arguments.signal && typeof tc.arguments.signal === 'string') {
+                    queriedSignals.add(tc.arguments.signal);
+                }
+                totalToolCalls++;
+            }
+
+            // Inject progress nudge
+            if (totalToolCalls < 15) {
+                const remaining = this.maxToolRounds - round - 1;
+                const signalList = [...queriedSignals].join(', ');
+                let hint = `[Progress: ${totalToolCalls} tool call(s), ${remaining} rounds remaining.`;
+                if (queriedSignals.size > 0) { hint += ` Signals queried: ${signalList}.`; }
+                if (totalToolCalls < 5) { hint += ' Make more tool calls before writing analysis.'; }
+                hint += ']';
+                toolHistory.push({ role: 'tool', name: 'system', content: hint });
             }
         }
         return 'Tool loop exceeded maximum rounds without a final answer.';
@@ -321,15 +380,7 @@ export class OpenAICompatibleClient implements LLMProvider {
 
         const finalMsgs: LLMMessage[] = [...msgs, {
             role: 'user' as const,
-            content: `Now provide your analysis as plain text (no tool calls).
-
-Structure your response as:
-## System Overview — Identify the design from HDL modules.
-## Key Events Timeline — 3-5 significant events with timestamps, RTL citations, and decoded values.
-## Signal Correlations — Cross-module dependencies with RTL line quotes.
-## Summary — What the circuit is doing overall.
-
-RULES: Cite exact RTL lines. Decode hex values in context. Depth over breadth.`,
+            content: FINAL_ANALYSIS_PROMPT,
         }];
 
         // Enforce budget on the final prompt (which includes all tool history)
@@ -392,9 +443,8 @@ RULES: Cite exact RTL lines. Decode hex values in context. Depth over breadth.`,
             content: m.content,
         }));
 
-        // Pre-execute list_signals and inject it into the conversation.
-        // Ollama ignores tool_choice:'required', so we seed real data upfront
-        // to prevent hallucination on the first round.
+        // Pre-execute list_signals so the model knows what's available.
+        // Do NOT pre-seed snapshots — let the model make its own tool calls.
         const listResult = toolExecutor('list_signals', {});
         const fakeCallId = 'preseed_list_signals';
         msgs.push({
@@ -408,38 +458,22 @@ RULES: Cite exact RTL lines. Decode hex values in context. Depth over breadth.`,
         });
         msgs.push({ role: 'tool', tool_call_id: fakeCallId, content: listResult });
 
-        // Pre-seed: snapshot at range boundaries for an efficient overview.
-        const userMsg = [...messages].reverse().find(m => m.role === 'user');
-        const rangeMatch = userMsg?.content.match(/t_start=(\d+)[\s\S]*?t_end=(\d+)/);
-        if (rangeMatch) {
-            const tStart = Number(rangeMatch[1]);
-            const tEnd = Number(rangeMatch[2]);
-
-            const startSnapId = 'preseed_snap_start';
-            const endSnapId = 'preseed_snap_end';
-            const startResult = toolExecutor('snapshot', { time: tStart });
-            const endResult = toolExecutor('snapshot', { time: tEnd });
-
-            msgs.push({
-                role: 'assistant',
-                content: null,
-                tool_calls: [
-                    { id: startSnapId, type: 'function', function: { name: 'snapshot', arguments: JSON.stringify({ time: tStart }) } },
-                    { id: endSnapId, type: 'function', function: { name: 'snapshot', arguments: JSON.stringify({ time: tEnd }) } },
-                ],
-            });
-            msgs.push({ role: 'tool', tool_call_id: startSnapId, content: startResult });
-            msgs.push({ role: 'tool', tool_call_id: endSnapId, content: endResult });
-        }
+        // Force tool use for the first few rounds to ensure sufficient data gathering
+        const minForcedRounds = Math.min(3, this.maxToolRounds);
+        let totalToolCalls = 0;
+        const queriedSignals = new Set<string>();
 
         for (let round = 0; round < this.maxToolRounds; round++) {
             if (signal?.aborted) { return ''; }
+
+            // Force tool calling for the first minForcedRounds
+            const toolChoiceParam = round < minForcedRounds ? 'required' as const : 'auto' as const;
 
             const response = await this.client.chat.completions.create({
                 model: this.model,
                 messages: msgs,
                 tools: oaiTools,
-                tool_choice: 'auto',
+                tool_choice: toolChoiceParam,
             }, { signal });
 
             const message = response.choices[0]?.message;
@@ -453,12 +487,46 @@ RULES: Cite exact RTL lines. Decode hex values in context. Depth over breadth.`,
                 return await this.streamFinalResponse(msgs, signal, onProgress, hdlContext);
             }
 
+            // Deduplicate tool calls (small models often repeat the same call)
+            const seen = new Map<string, string>(); // key → cached result
             for (const tc of message.tool_calls) {
                 let args: Record<string, unknown> = {};
                 try { args = JSON.parse(tc.function.arguments); } catch { /* ignore */ }
-                onProgress?.({ type: 'tool_call', name: tc.function.name, args });
-                const result = toolExecutor(tc.function.name, args);
+                const dedupKey = JSON.stringify({ n: tc.function.name, a: args });
+                let result: string;
+                if (seen.has(dedupKey)) {
+                    result = `[DUPLICATE — same result as previous identical call]\n${seen.get(dedupKey)!}`;
+                } else {
+                    onProgress?.({ type: 'tool_call', name: tc.function.name, args });
+                    result = toolExecutor(tc.function.name, args);
+                    seen.set(dedupKey, result);
+                }
+                // Track queried signals
+                if (args.signal && typeof args.signal === 'string') {
+                    queriedSignals.add(args.signal as string);
+                }
+                totalToolCalls++;
+                // Must respond to every tool_call id or the API rejects it
                 msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
+            }
+
+            // Inject progress nudge as a system-like tool result annotation
+            if (totalToolCalls < 15) {
+                const remaining = this.maxToolRounds - round - 1;
+                const signalList = [...queriedSignals].join(', ');
+                let hint = `[Progress: ${totalToolCalls} tool call(s) so far, ${remaining} rounds remaining.`;
+                if (queriedSignals.size > 0) {
+                    hint += ` Signals queried: ${signalList}.`;
+                }
+                if (totalToolCalls < 5) {
+                    hint += ' Make more tool calls before writing analysis — try snapshot(), query_transitions() on control signals, or decode_instruction().';
+                }
+                hint += ']';
+                // Append hint to the last tool result
+                const lastToolMsg = msgs[msgs.length - 1];
+                if (lastToolMsg.role === 'tool' && typeof lastToolMsg.content === 'string') {
+                    (lastToolMsg as { content: string }).content += '\n\n' + hint;
+                }
             }
         }
         return 'Tool loop exceeded maximum rounds without a final answer.';
@@ -474,29 +542,7 @@ RULES: Cite exact RTL lines. Decode hex values in context. Depth over breadth.`,
         // HDL context is already in the conversation — don't re-inject to save tokens
         const finalMsgs: OpenAI.ChatCompletionMessageParam[] = [...msgs, {
             role: 'user' as const,
-            content: `Now provide your analysis as plain text (no JSON, no tool calls).
-
-Structure your response as follows:
-
-## System Overview
-Briefly identify the design (e.g. CPU architecture, SoC components) based on the HDL modules.
-
-## Key Events Timeline
-For the 3-5 most significant events in the time range:
-- **t=<timestamp>**: Describe what happened and why.
-- Quote the specific RTL line that explains the behavior (e.g. \`assign X = Y ? A : B;\` from module_name).
-- Decode any data values in context (e.g. "0x00050663 on IDATA is a BEQ instruction: opcode=1100011, funct3=000, branch offset=12").
-
-## Signal Correlations
-Explain how signals interact across modules. For each claim, cite the RTL line that creates the dependency.
-
-## Summary
-What is the circuit doing overall during this time window? (e.g. "The CPU is executing a loop that reads from peripheral registers and branches based on the result.")
-
-RULES:
-- Do NOT list raw hex values without explaining what they mean in circuit context.
-- Every RTL reference must be an exact quote from the HDL source provided — never paraphrase or invent code.
-- Focus on depth over breadth: analyze a few events thoroughly rather than many events superficially.`,
+            content: FINAL_ANALYSIS_PROMPT,
         }];
 
         if (!onProgress) {

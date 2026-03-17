@@ -79,23 +79,29 @@ const TOOL_SYSTEM_PROMPT = `You are an expert hardware verification engineer ana
 You have access to tools to query a waveform database. The list_signals result has already been provided — do NOT call list_signals again.
 
 TOOL USAGE:
-- When the user specifies a time range, use those EXACT values as t_start and t_end. Never substitute your own.
-- Use snapshot() to get ALL signal values at a single moment — much more efficient than repeated get_value_at calls.
-- Use get_next_transition() / get_prev_transition() to walk through events one at a time — avoids dumping huge ranges.
-- Use find_pattern() to search for specific values (e.g. "when does VALID go high?") instead of scanning all transitions.
-- Use count_transitions() to gauge signal activity BEFORE deciding to fetch data — skip quiet signals.
-- Use get_edges() for clock/enable signals — only returns rising/falling edges, filtering noise.
-- Use query_transitions() as a last resort for bulk data in a range.
-- Use decode_instruction() on any instruction bus value (IDATA, instruction, etc.) to get the exact assembly mnemonic and operands. ALWAYS decode instruction values instead of guessing opcodes.
+Make 5-25 tool calls before writing your final analysis. Do NOT rush to conclusions after 1-2 calls.
+Each round, call MULTIPLE tools in parallel when possible (e.g. query 2-3 different signals at once).
+NEVER call the same tool with the same arguments twice — you already have that data.
+When the user specifies a time range, use those EXACT values as t_start and t_end.
 
-ANALYSIS METHODOLOGY:
-1. Start with snapshot() at the beginning and end of the time range to see what changed.
-2. Use find_pattern() and get_edges() to identify key events (e.g. rising edge of VALID, specific address values).
-3. For each key event, use snapshot() to see the full circuit state at that moment.
-4. Use get_next_transition() / get_prev_transition() to trace causality chains between signals.
-5. Cross-reference observed values against the RTL source — quote the specific Verilog line that explains the behavior.
-6. Decode data values in context: instruction bus values are opcodes, address bus values are memory regions, control signals drive state machines.
-7. Build a narrative of what the circuit is doing over time, not just a list of values.
+Available tools:
+- snapshot(time) — get ALL signal values at a single moment. Call this at MULTIPLE timestamps.
+- query_transitions(signal, t_start, t_end) — get all transitions for a signal (capped at 150).
+- get_next_transition(signal, after_time) / get_prev_transition(signal, before_time) — walk events one at a time.
+- find_pattern(signal, value, t_start, t_end) — search for specific values.
+- count_transitions(signal, t_start, t_end) — gauge signal activity before fetching data.
+- get_edges(signal, edge, t_start, t_end) — rising/falling edges only.
+- decode_instruction(value, isa) — decode raw instruction words into assembly. Use this on EVERY instruction value you see.
+
+INVESTIGATION PLAN — follow these steps in order, making parallel calls where possible:
+1. PARALLEL: query_transitions() on the PC/IADDR signal AND an instruction data signal (IDATA/XIDATA) for the time range.
+2. PARALLEL: snapshot() at the START and END of the time range, plus 1-2 mid-range timestamps.
+3. decode_instruction() on EVERY unique instruction value from step 1 — call multiple in parallel.
+4. query_transitions() on 2-3 control/data signals (HLT, FLUSH, XDREQ, DRW, DWR, DADDR) to find pipeline stalls, branches, memory accesses.
+5. If you see anomalies (stalls, unexpected branches), zoom in with get_next_transition() or additional snapshots.
+6. Now write your analysis using ALL the data gathered above.
+
+IMPORTANT: If you receive a progress hint saying you have made too few calls, KEEP INVESTIGATING. Query more signals, take more snapshots, decode more instructions. The progress hint tells you how many rounds remain.
 
 CITATION REQUIREMENT:
 When referencing RTL behavior, quote the actual Verilog code from the provided HDL source. For example:
@@ -303,6 +309,9 @@ export class ChatPanel {
     }
 
     static createOrShow(tracker: SignalTracker, log: vscode.OutputChannel): ChatPanel {
+        // Re-initialize tracker in case VaporView activated after our extension
+        tracker.initialize();
+
         if (ChatPanel.instance) {
             ChatPanel.instance.panel.reveal(vscode.ViewColumn.Beside);
             return ChatPanel.instance;
@@ -696,16 +705,34 @@ function buildWaveformSummary(idx: WaveformIndex, selSet: Set<string> | null): s
     const signals = selSet ? allSignals.filter(s => selSet.has(s.name)) : allSignals;
     const top = [...signals].sort((a, b) => b.transitionCount - a.transitionCount).slice(0, 30);
 
+    // Identify instruction bus signals so the model knows to query them
+    const instrSignals = signals.filter(s => INSTRUCTION_SIGNAL_RE.test(s.name));
+
     const lines = [
         `## Waveform Summary (tool-query mode)`,
         `File: ${idx.uri}`,
         `Time range: ${idx.startTime} \u2013 ${idx.endTime} (timescale: ${idx.timescale})`,
         `Signals available: ${signals.length} — use list_signals() for full list, query_transitions() to fetch data`,
-        ``,
-        `Top signals by activity:`,
-        ...top.map(s => `  ${s.name}: ${s.transitionCount} transitions`),
-        ...(signals.length > 30 ? [`  \u2026 and ${signals.length - 30} more`] : []),
     ];
+
+    if (instrSignals.length > 0) {
+        lines.push(``);
+        lines.push(`Instruction bus signals (auto-decoded when ISA is set):`);
+        for (const s of instrSignals) {
+            lines.push(`  [INSTR] ${s.name}: ${s.transitionCount} transitions — QUERY THIS to see decoded assembly`);
+        }
+    }
+
+    lines.push(``);
+    lines.push(`Top signals by activity:`);
+    for (const s of top) {
+        const tag = INSTRUCTION_SIGNAL_RE.test(s.name) ? ' [INSTR]' : '';
+        lines.push(`  ${s.name}: ${s.transitionCount} transitions${tag}`);
+    }
+    if (signals.length > 30) {
+        lines.push(`  \u2026 and ${signals.length - 30} more`);
+    }
+
     return lines.join('\n');
 }
 

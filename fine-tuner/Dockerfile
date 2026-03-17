@@ -10,6 +10,9 @@ FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 RUN pip install --no-cache-dir \
     transformers peft hf_transfer "datasets==4.3.0" "trl==0.26.1" && \
-    pip install --no-cache-dir --no-deps unsloth unsloth_zoo bitsandbytes
+    pip install --no-cache-dir --no-deps unsloth unsloth_zoo bitsandbytes && \
+    pip install openai
 
 WORKDIR /workspace
+
+COPY teacher.py train.py ./
