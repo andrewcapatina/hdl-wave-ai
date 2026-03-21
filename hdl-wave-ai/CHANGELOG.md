@@ -4,6 +4,31 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.5] - 2026-03-21
+
+### Added
+- **Design-agnostic analysis** — system prompt and output templates no longer assume CPU architecture. Correctly handles systolic arrays, accelerators, DSP blocks, peripherals, and any digital design without fabricating instruction traces
+- **Structured final analysis re-prompt** — both Anthropic and OpenAI providers now re-prompt the model without tools for the final response, using a structured template. Separates "investigation phase" (tool calls only) from "analysis phase" (clean output)
+- **Thinking tag filter for reasoning models** — `ThinkingStreamFilter` strips `<think>...</think>` blocks from Qwen 3, DeepSeek R1, and similar models during streaming, so users only see the structured analysis
+- **Progress hints in tool loop** — after each tool round, the model receives a progress nudge: encouragement when under 5 calls, gentle guidance at 5-15 calls, and a "stop and write" signal at 15+ calls
+- **`onProgress` callback for Anthropic provider** — tool calls and streamed chunks are now reported via the progress callback, enabling proper logging and UI streaming
+- **Context compression for long tool loops** — `compressToolHistory()` summarizes older tool results when context exceeds ~16K tokens, keeping recent results intact and telling the model to re-query if needed
+
+### Improved
+- **Tool loop forced rounds** — first 3 rounds force tool use (`tool_choice: 'any'` for Anthropic, `'required'` for OpenAI) to ensure sufficient data gathering before analysis. Previously only round 0 was forced
+- **Tool loop round budget** — auto-calculation changed from `maxTokens/2000` (clamped 5-30) to `maxTokens/4000` (clamped 5-12). Prevents runaway 150-call sessions while still allowing thorough investigation
+- **Exit condition fix** — removed `|| response.stop_reason === 'end_turn'` check that caused premature exit when tool blocks were present alongside text in the same response
+- **Duplicate tool call handling** — duplicates now return the cached result prefixed with `[DUPLICATE]` so the model sees it wasted a call, rather than silently re-executing
+- **System prompt rewritten for tool discipline** — explicit rules: no prose during investigation, no fabricated data, no guessed assembly, adapt to actual design type. Per-round investigation plan with parallel calls
+- **`FINAL_ANALYSIS_PROMPT` redesigned** — generic sections (System Overview, Signal Trace, Key Events, Data Flow, Summary) replace CPU-specific ones (Instruction Trace, Data Bus Activity). Explicit rules against inventing PCs or assembly for non-CPU designs
+- **`toolLoop.maxRounds` setting** — maximum lowered from 150 to 30, description updated to reflect new auto-calculation formula
+
+### Fixed
+- Anthropic provider exiting tool loop when `stop_reason === 'end_turn'` even though tool_use blocks were present in the response
+- OpenAI chat provider ignoring forced rounds — model could skip tools during first 3 rounds and immediately produce final response
+- Chain-of-thought reasoning from reasoning models (Qwen 3, DeepSeek) leaking into user-visible output
+- Model hallucinating CPU instruction traces for non-CPU designs (systolic arrays, accelerators, etc.)
+
 ## [0.2.1] - 2026-03-16
 
 ### Added

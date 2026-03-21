@@ -15,7 +15,47 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import Anthropic from '@anthropic-ai/sdk';
-import { LLMMessage, LLMProvider, ToolDefinition } from './llm';
+import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './llm';
+
+const FINAL_ANALYSIS_PROMPT = `Now provide your final analysis using ONLY the data you gathered from tool calls. No more tool calls.
+Do NOT include your reasoning process or chain-of-thought. Write ONLY the structured analysis.
+
+IMPORTANT: Adapt your analysis to the ACTUAL design. Do NOT assume this is a CPU — it could be a systolic array, DSP, accelerator, peripheral controller, or any digital design. Only include sections that are relevant to the signals you observed. Never fabricate instruction traces, assembly code, or program counters for designs that don't have them.
+
+## System Overview
+One paragraph: what is this design? Describe the actual architecture based on the signal names and HDL modules you can see. (e.g. CPU with pipeline stages, systolic array for matrix math, DMA controller, UART, etc.)
+
+## Signal Trace
+Build a table of the key signal transitions you queried. Include timestamps, signal names, and values.
+For CPU designs with PC/IADDR signals, include decoded instructions (from decode_instruction results ONLY).
+For non-CPU designs, trace the state machine, control signals, and data flow instead.
+
+| Time | Signal | Value | Meaning |
+|------|--------|-------|---------|
+| ... | ... | ... | ... |
+
+## Key Events
+Pick 3-5 important moments from the trace (state transitions, data transfers, handshakes, stalls, errors).
+For each event:
+- What happened and WHY (not just what signal changed)
+- Quote the exact RTL line from the HDL source that explains it
+- Connect cause to effect across signals
+
+## Data Flow
+Summarize the data movement observed:
+- What data was transferred and between which interfaces?
+- What control signals governed the transfers?
+- Were there any stalls, backpressure, or error conditions?
+
+## Summary
+2-3 sentences: What is this design doing in plain English during the analyzed time window?
+
+RULES:
+- Only use data from your tool call results — never guess or fabricate values.
+- Every RTL citation must be an exact quote from the provided HDL source.
+- If you did not call decode_instruction(), do NOT write assembly mnemonics.
+- If the design has no program counter, do NOT invent one.
+`;
 
 export class AnthropicClient implements LLMProvider {
     private client: Anthropic;
@@ -25,9 +65,11 @@ export class AnthropicClient implements LLMProvider {
     constructor(apiKey: string, model: string, maxToolRounds = 0, maxPromptTokens = 200000) {
         this.client = new Anthropic({ apiKey });
         this.model = model;
+        // Auto-calculate: aim for 5-12 rounds (each round may have multiple parallel tool calls).
+        // 12 rounds × ~3 calls/round ≈ 36 calls, which is plenty for thorough analysis.
         this.maxToolRounds = maxToolRounds > 0
             ? maxToolRounds
-            : Math.max(5, Math.min(30, Math.floor(maxPromptTokens / 2000)));
+            : Math.max(5, Math.min(12, Math.floor(maxPromptTokens / 4000)));
     }
 
     async chat(messages: LLMMessage[]): Promise<string> {
@@ -72,7 +114,9 @@ export class AnthropicClient implements LLMProvider {
         messages: LLMMessage[],
         tools: ToolDefinition[],
         toolExecutor: (name: string, args: Record<string, unknown>) => string,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        onProgress?: (event: ToolProgressEvent) => void,
+        _hdlContext?: string,
     ): Promise<string> {
         const anthropicTools: Anthropic.Tool[] = tools.map(t => ({
             name: t.name,
@@ -114,11 +158,24 @@ export class AnthropicClient implements LLMProvider {
                 (b): b is Anthropic.ToolUseBlock => b.type === 'tool_use'
             );
 
-            if (!toolUseBlocks.length || response.stop_reason === 'end_turn') {
-                const textBlock = response.content.find(b => b.type === 'text');
-                return textBlock?.type === 'text' ? textBlock.text : '';
+            // Only exit when there are NO tool blocks AND we're past forced rounds.
+            // During forced rounds, if the model somehow returns no tools, nudge it.
+            if (!toolUseBlocks.length) {
+                if (round < minForcedRounds) {
+                    // Model tried to stop too early — push it back to tool use
+                    msgs.push({ role: 'assistant', content: response.content });
+                    msgs.push({
+                        role: 'user',
+                        content: `You have only made ${totalToolCalls} tool call(s). You MUST make more tool calls before writing your analysis. Call snapshot(), query_transitions(), or decode_instruction() now.`,
+                    });
+                    continue;
+                }
+                // Past forced rounds — produce final analysis via a clean re-prompt
+                break;
             }
 
+            // Process tool calls even if stop_reason is 'end_turn' — the model
+            // may have included both text and tool blocks in the same response.
             msgs.push({ role: 'assistant', content: response.content });
 
             // Deduplicate tool calls (small models often repeat the same call)
@@ -130,6 +187,7 @@ export class AnthropicClient implements LLMProvider {
                 if (seen.has(key)) {
                     result = `[DUPLICATE — same result as previous identical call]\n${seen.get(key)!}`;
                 } else {
+                    onProgress?.({ type: 'tool_call', name: b.name, args: input });
                     result = toolExecutor(b.name, input);
                     seen.set(key, result);
                 }
@@ -141,55 +199,79 @@ export class AnthropicClient implements LLMProvider {
                 return { type: 'tool_result' as const, tool_use_id: b.id, content: result };
             });
 
-            // Inject a progress nudge so the model knows where it stands.
-            const progressHint = this.buildProgressHint(totalToolCalls, queriedSignals, round, this.maxToolRounds);
-            if (progressHint) {
-                toolResults.push({
-                    type: 'tool_result' as const,
-                    tool_use_id: toolUseBlocks[toolUseBlocks.length - 1].id,
-                    content: toolResults[toolResults.length - 1].content + '\n\n' + progressHint,
-                });
-                // Replace the last result with the augmented one
-                toolResults.splice(-2, 1);
+            // Append progress hint to the last tool result (not as a separate result
+            // — Anthropic requires exactly one result per tool_use_id).
+            {
+                const remaining = this.maxToolRounds - round - 1;
+                let hint: string;
+                if (totalToolCalls < 5) {
+                    const signalList = [...queriedSignals].join(', ');
+                    hint = `\n\n[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. Signals queried: ${signalList || 'none'}. Make more calls — try snapshot(), query_transitions() on control signals, or decode_instruction().]`;
+                } else if (totalToolCalls < 15) {
+                    hint = `\n\n[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. You have good data — a few more targeted calls then write your analysis.]`;
+                } else {
+                    hint = `\n\n[You have made ${totalToolCalls} tool calls. You have sufficient data. Stop calling tools and write your final analysis now.]`;
+                }
+                const lastResult = toolResults[toolResults.length - 1];
+                lastResult.content = (lastResult.content as string) + hint;
             }
 
             msgs.push({ role: 'user', content: toolResults });
 
             // Compress old tool results if context is growing too large.
-            // Keep the first user message and last 4 message pairs intact;
-            // summarize everything in between.
             this.compressToolHistory(msgs);
         }
-        return 'Tool loop exceeded maximum rounds without a final answer.';
+
+        // Final analysis: re-prompt the model without tools, using the structured
+        // output template. This prevents chain-of-thought leaking into the response.
+        return await this.streamFinalAnalysis(systemMsg?.content, msgs, signal, onProgress);
     }
 
     /**
-     * Build a progress hint to inject after tool results, nudging the model
-     * to keep investigating if it hasn't gathered enough data yet.
+     * Stream the final analysis by re-prompting without tools, using the
+     * structured FINAL_ANALYSIS_PROMPT template. This ensures the model
+     * produces clean output without chain-of-thought reasoning.
      */
-    private buildProgressHint(
-        totalCalls: number,
-        queriedSignals: Set<string>,
-        currentRound: number,
-        maxRounds: number,
-    ): string | null {
-        if (totalCalls >= 15) { return null; } // enough calls, let the model decide
+    private async streamFinalAnalysis(
+        system: string | undefined,
+        msgs: Anthropic.MessageParam[],
+        signal?: AbortSignal,
+        onProgress?: (event: ToolProgressEvent) => void,
+    ): Promise<string> {
+        // Add the final analysis prompt as a user message
+        const finalMsgs: Anthropic.MessageParam[] = [...msgs, {
+            role: 'user' as const,
+            content: FINAL_ANALYSIS_PROMPT,
+        }];
 
-        const signalList = [...queriedSignals].join(', ');
-        const remaining = maxRounds - currentRound - 1;
-        const parts: string[] = [];
-
-        parts.push(`[Progress: ${totalCalls} tool call(s) so far, ${remaining} rounds remaining.]`);
-
-        if (queriedSignals.size > 0) {
-            parts.push(`Signals queried so far: ${signalList}.`);
+        if (!onProgress) {
+            const response = await this.client.messages.create({
+                model: this.model,
+                max_tokens: 4096,
+                system,
+                messages: finalMsgs,
+            });
+            const textBlock = response.content.find(b => b.type === 'text');
+            return textBlock?.type === 'text' ? textBlock.text : '';
         }
 
-        if (totalCalls < 5) {
-            parts.push('You should make more tool calls before writing your analysis. Consider: snapshot() at key timestamps, query_transitions() on control signals (HLT, FLUSH, XDREQ), or decode_instruction() on fetched instruction values.');
-        }
+        // Stream the response
+        const stream = this.client.messages.stream({
+            model: this.model,
+            max_tokens: 4096,
+            system,
+            messages: finalMsgs,
+        }, { signal });
 
-        return parts.join(' ');
+        let full = '';
+        for await (const event of stream) {
+            if (signal?.aborted) { break; }
+            if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+                full += event.delta.text;
+                onProgress({ type: 'chunk', text: event.delta.text });
+            }
+        }
+        return full;
     }
 
     /**

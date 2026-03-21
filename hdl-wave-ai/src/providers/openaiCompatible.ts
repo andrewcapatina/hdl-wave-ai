@@ -19,37 +19,97 @@ import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './ll
 
 const FINAL_ANALYSIS_PROMPT = `Now provide your final analysis using ONLY the data you gathered from tool calls. No more tool calls.
 
+IMPORTANT: Adapt your analysis to the ACTUAL design. Do NOT assume this is a CPU — it could be a systolic array, DSP, accelerator, peripheral controller, or any digital design. Only include sections that are relevant to the signals you observed. Never fabricate instruction traces, assembly code, or program counters for designs that don't have them.
+
 ## System Overview
-One paragraph: what is this design? (CPU arch, SoC components, bus structure)
+One paragraph: what is this design? Describe the actual architecture based on the signal names and HDL modules you can see.
 
-## Instruction Trace
-Build a table from the IDATA/inst transitions you queried. Use the auto-decoded assembly from the tool results.
-Include ALL instructions you found — do not skip any.
+## Signal Trace
+Build a table of the key signal transitions you queried. Include timestamps, signal names, and values.
+For CPU designs with PC/IADDR signals, include decoded instructions (from decode_instruction results ONLY).
+For non-CPU designs, trace the state machine, control signals, and data flow instead.
 
-| Time | PC (IADDR) | Hex | Assembly | What it does |
-|------|-----------|-----|----------|-------------|
-| ... | ... | ... | ... | ... |
+| Time | Signal | Value | Meaning |
+|------|--------|-------|---------|
+| ... | ... | ... | ... |
 
 ## Key Events
-Pick 3-5 important moments from the trace above (branches taken, memory accesses, stalls).
+Pick 3-5 important moments from the trace (state transitions, data transfers, handshakes, stalls, errors).
 For each event:
 - What happened and WHY (not just what signal changed)
 - Quote the exact RTL line from the HDL source that explains it
-- Connect it to the instruction being executed
+- Connect cause to effect across signals
 
-## Data Bus Activity
-Summarize memory reads/writes from XADDR, XATAO, DADDR transitions:
-- What addresses were accessed?
-- Were they reads or writes? (XRD/XWR)
-- What data was transferred?
+## Data Flow
+Summarize the data movement observed:
+- What data was transferred and between which interfaces?
+- What control signals governed the transfers?
+- Were there any stalls, backpressure, or error conditions?
 
 ## Summary
-2-3 sentences: What is the CPU doing in plain English? (e.g. "polling a UART status register in a loop, then writing a character")
+2-3 sentences: What is this design doing in plain English during the analyzed time window?
 
 RULES:
-- Use the decoded assembly from tool results — do NOT re-decode hex values yourself.
+- Only use data from your tool call results — never guess or fabricate values.
 - Every RTL citation must be an exact quote from the provided HDL source.
-- If you did not query a signal, do NOT guess its value.`;
+- If you did not call decode_instruction(), do NOT write assembly mnemonics.
+- If the design has no program counter, do NOT invent one.
+- If you did not query a signal, do NOT guess its value. `;
+
+/**
+ * Strip <think>...</think> blocks that reasoning models (Qwen 3, DeepSeek, etc.)
+ * emit before their actual answer. Works on complete text.
+ */
+function stripThinkingTags(text: string): string {
+    // Remove all <think>...</think> blocks (greedy, handles newlines)
+    return text.replace(/<think>[\s\S]*?<\/think>\s*/g, '').trimStart();
+}
+
+/**
+ * Streaming filter that buffers text until any leading <think>...</think> block
+ * is fully received and stripped, then passes through remaining chunks unchanged.
+ */
+class ThinkingStreamFilter {
+    private buffer = '';
+    private pastThinking = false;
+
+    /** Feed a chunk; returns the text to emit (may be empty while buffering). */
+    push(chunk: string): string {
+        if (this.pastThinking) { return chunk; }
+
+        this.buffer += chunk;
+
+        // If we haven't seen <think> at all and have enough text to be sure
+        if (!this.buffer.startsWith('<think') && this.buffer.length > 10) {
+            this.pastThinking = true;
+            const out = this.buffer;
+            this.buffer = '';
+            return out;
+        }
+
+        // Still might be inside a <think> block — check for closing tag
+        const closeIdx = this.buffer.indexOf('</think>');
+        if (closeIdx >= 0) {
+            this.pastThinking = true;
+            const afterThink = this.buffer.slice(closeIdx + '</think>'.length).trimStart();
+            this.buffer = '';
+            return afterThink;
+        }
+
+        // Still buffering — don't emit yet
+        return '';
+    }
+
+    /** Flush any remaining buffer (in case </think> was never closed). */
+    flush(): string {
+        if (this.buffer) {
+            const out = stripThinkingTags(this.buffer);
+            this.buffer = '';
+            return out;
+        }
+        return '';
+    }
+}
 
 export class OpenAICompatibleClient implements LLMProvider {
     private client: OpenAI;
@@ -63,10 +123,10 @@ export class OpenAICompatibleClient implements LLMProvider {
         this.model = model;
         this.useCompletions = useCompletions;
         this.maxPromptTokens = maxPromptTokens;
-        // 0 = auto: derive from token budget
+        // 0 = auto: aim for 5-12 rounds (each round may have multiple parallel calls)
         this.maxToolRounds = maxToolRounds > 0
             ? maxToolRounds
-            : Math.max(5, Math.min(30, Math.floor(maxPromptTokens / 2000)));
+            : Math.max(5, Math.min(12, Math.floor(maxPromptTokens / 4000)));
     }
 
     // ── ChatML formatting for completions endpoint ──────────────────────
@@ -218,7 +278,22 @@ export class OpenAICompatibleClient implements LLMProvider {
             return this.charsToTokens(prompt.length);
         };
 
-        // Phase 1: trim tool history (keep first 2 = list_signals)
+        // Phase 1: trim tool history, but protect instruction-related results.
+        // First pass: remove non-essential entries (snapshots, non-INSTR queries) from oldest.
+        // Second pass: if still over, remove anything from oldest.
+        const isInstrResult = (entry: { role: string; name?: string; content: string }) =>
+            entry.role === 'tool' && entry.content && /→\s*\w/.test(entry.content);
+
+        // Pass 1: remove non-instruction tool results from oldest (skip first 2 = list_signals)
+        let idx = 2;
+        while (idx < toolHistory.length && measure() > maxTokens) {
+            if (!isInstrResult(toolHistory[idx])) {
+                toolHistory.splice(idx, 1);
+            } else {
+                idx++;
+            }
+        }
+        // Pass 2: if still over, remove anything from oldest
         while (toolHistory.length > 2 && measure() > maxTokens) {
             toolHistory.splice(2, 1);
         }
@@ -353,14 +428,18 @@ export class OpenAICompatibleClient implements LLMProvider {
                 totalToolCalls++;
             }
 
-            // Inject progress nudge
-            if (totalToolCalls < 15) {
+            // Inject progress nudge — encourage early, then tell model to wrap up
+            {
                 const remaining = this.maxToolRounds - round - 1;
-                const signalList = [...queriedSignals].join(', ');
-                let hint = `[Progress: ${totalToolCalls} tool call(s), ${remaining} rounds remaining.`;
-                if (queriedSignals.size > 0) { hint += ` Signals queried: ${signalList}.`; }
-                if (totalToolCalls < 5) { hint += ' Make more tool calls before writing analysis.'; }
-                hint += ']';
+                let hint: string;
+                if (totalToolCalls < 5) {
+                    const signalList = [...queriedSignals].join(', ');
+                    hint = `[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. Signals queried: ${signalList || 'none'}. Make more tool calls before writing analysis.]`;
+                } else if (totalToolCalls < 15) {
+                    hint = `[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. You have good data — a few more targeted calls then write your analysis.]`;
+                } else {
+                    hint = `[You have made ${totalToolCalls} tool calls. You have sufficient data. Stop calling tools and write your final analysis now.]`;
+                }
                 toolHistory.push({ role: 'tool', name: 'system', content: hint });
             }
         }
@@ -396,7 +475,7 @@ export class OpenAICompatibleClient implements LLMProvider {
                 max_tokens: 4096,
                 stop: ['<|im_end|>'],
             });
-            return resp.choices[0]?.text ?? '';
+            return stripThinkingTags(resp.choices[0]?.text ?? '');
         }
 
         const stream = await this.client.completions.create({
@@ -408,13 +487,22 @@ export class OpenAICompatibleClient implements LLMProvider {
         }, { signal });
 
         let full = '';
+        const filter = new ThinkingStreamFilter();
         for await (const chunk of stream) {
             if (signal?.aborted) { break; }
             const text = chunk.choices[0]?.text;
             if (text) {
-                full += text;
-                onProgress({ type: 'chunk', text });
+                const filtered = filter.push(text);
+                if (filtered) {
+                    full += filtered;
+                    onProgress({ type: 'chunk', text: filtered });
+                }
             }
+        }
+        const remaining = filter.flush();
+        if (remaining) {
+            full += remaining;
+            onProgress({ type: 'chunk', text: remaining });
         }
         return full;
     }
@@ -481,9 +569,15 @@ export class OpenAICompatibleClient implements LLMProvider {
             msgs.push(message);
 
             if (!message.tool_calls?.length) {
-                // Always re-prompt without tools for the final response.
-                // This ensures streaming works AND gives the model a clean
-                // break from tool mode, producing better analysis text.
+                if (round < minForcedRounds) {
+                    // Model tried to stop too early — nudge it back to tool calling
+                    msgs.push({
+                        role: 'user' as const,
+                        content: `You have only made ${totalToolCalls} tool call(s). You MUST make more tool calls before writing your analysis. Call snapshot(), query_transitions(), or decode_instruction() now.`,
+                    });
+                    continue;
+                }
+                // Past forced rounds — produce final analysis via clean re-prompt
                 return await this.streamFinalResponse(msgs, signal, onProgress, hdlContext);
             }
 
@@ -510,18 +604,18 @@ export class OpenAICompatibleClient implements LLMProvider {
                 msgs.push({ role: 'tool', tool_call_id: tc.id, content: result });
             }
 
-            // Inject progress nudge as a system-like tool result annotation
-            if (totalToolCalls < 15) {
+            // Inject progress nudge — encourage early, then tell model to wrap up
+            {
                 const remaining = this.maxToolRounds - round - 1;
-                const signalList = [...queriedSignals].join(', ');
-                let hint = `[Progress: ${totalToolCalls} tool call(s) so far, ${remaining} rounds remaining.`;
-                if (queriedSignals.size > 0) {
-                    hint += ` Signals queried: ${signalList}.`;
-                }
+                let hint: string;
                 if (totalToolCalls < 5) {
-                    hint += ' Make more tool calls before writing analysis — try snapshot(), query_transitions() on control signals, or decode_instruction().';
+                    const signalList = [...queriedSignals].join(', ');
+                    hint = `[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. Signals queried: ${signalList || 'none'}. Make more calls — try snapshot(), query_transitions() on control signals, or decode_instruction().]`;
+                } else if (totalToolCalls < 15) {
+                    hint = `[Progress: ${totalToolCalls} call(s), ${remaining} rounds left. You have good data — a few more targeted calls then write your analysis.]`;
+                } else {
+                    hint = `[You have made ${totalToolCalls} tool calls. You have sufficient data. Stop calling tools and write your final analysis now.]`;
                 }
-                hint += ']';
                 // Append hint to the last tool result
                 const lastToolMsg = msgs[msgs.length - 1];
                 if (lastToolMsg.role === 'tool' && typeof lastToolMsg.content === 'string') {
@@ -550,7 +644,7 @@ export class OpenAICompatibleClient implements LLMProvider {
                 model: this.model,
                 messages: finalMsgs,
             }, { signal });
-            return resp.choices[0]?.message?.content ?? '';
+            return stripThinkingTags(resp.choices[0]?.message?.content ?? '');
         }
 
         const stream = await this.client.chat.completions.create({
@@ -560,13 +654,22 @@ export class OpenAICompatibleClient implements LLMProvider {
         }, { signal });
 
         let full = '';
+        const filter = new ThinkingStreamFilter();
         for await (const chunk of stream) {
             if (signal?.aborted) { break; }
             const delta = chunk.choices[0]?.delta?.content;
             if (delta) {
-                full += delta;
-                onProgress({ type: 'chunk', text: delta });
+                const filtered = filter.push(delta);
+                if (filtered) {
+                    full += filtered;
+                    onProgress({ type: 'chunk', text: filtered });
+                }
             }
+        }
+        const remaining = filter.flush();
+        if (remaining) {
+            full += remaining;
+            onProgress({ type: 'chunk', text: remaining });
         }
         return full;
     }

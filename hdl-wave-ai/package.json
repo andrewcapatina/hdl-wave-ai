@@ -157,8 +157,8 @@
           "type": "number",
           "default": 0,
           "minimum": 0,
-          "maximum": 50,
-          "description": "Maximum tool-call rounds before forcing a final answer. 0 (default) = auto-calculate from prompt.maxTokens (roughly maxTokens/2000, clamped 5-30). Increase for deeper analysis with larger context models."
+          "maximum": 30,
+          "description": "Maximum tool-call rounds before forcing a final answer. 0 (default) = auto-calculate from prompt.maxTokens (roughly maxTokens/4000, clamped 5-12). Each round can have multiple parallel tool calls, so 12 rounds ≈ 25-36 total calls."
         },
         "hdlWaveAi.isa": {
           "type": "string",
