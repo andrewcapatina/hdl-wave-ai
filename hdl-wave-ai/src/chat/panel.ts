@@ -618,11 +618,31 @@ export class ChatPanel {
                 }
 
                 const contextPrefix = summary + rangeHint + (hdlContext ? '\n\n' + hdlContext : '');
-                const fullUserContent = `${contextPrefix}\n\n---\n\n${msg.text}`;
 
-                // Use full history in conversational mode, but prefix context each time
+                // For follow-up questions (context already sent), don't re-inject the full
+                // waveform summary + HDL context — just send the user's question with a
+                // brief reminder. This prevents the model from copying previous analysis.
+                const isFollowUp = this.history.some(m => m.role === 'assistant');
+                const fullUserContent = isFollowUp
+                    ? `${msg.text}\n\n(Waveform and HDL context are the same as the previous query. Use tools to gather NEW data relevant to this specific question.)`
+                    : `${contextPrefix}\n\n---\n\n${msg.text}`;
+
+                // Build message array — for follow-ups, summarize previous assistant
+                // responses to prevent the model from just copying them
+                let historyForMessages = this.history.slice(-(maxHistory - 1));
+                if (isFollowUp) {
+                    historyForMessages = historyForMessages.map(m => {
+                        if (m.role === 'assistant' && m.content.length > 500) {
+                            // Truncate previous analysis to a brief summary so model doesn't copy it
+                            const firstParagraph = m.content.split('\n\n')[0] || m.content.slice(0, 200);
+                            return { ...m, content: `[Previous analysis summary: ${firstParagraph}...]\n\nUse tools to answer the NEW question — do not repeat the previous analysis.` };
+                        }
+                        return m;
+                    });
+                }
+
                 let messages: LLMMessage[] = conversational
-                    ? [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, ...this.history.slice(-(maxHistory - 1)), { role: 'user', content: fullUserContent }]
+                    ? [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, ...historyForMessages, { role: 'user', content: fullUserContent }]
                     : [{ role: 'system', content: TOOL_SYSTEM_PROMPT }, { role: 'user', content: fullUserContent }];
 
                 // If conversational history pushes us over budget, trim older messages

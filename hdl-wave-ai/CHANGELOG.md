@@ -4,7 +4,7 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
-## [0.2.5] - 2026-03-21
+## [0.2.6] - 2026-03-21
 
 ### Added
 - **Design-agnostic analysis** — system prompt and output templates no longer assume CPU architecture. Correctly handles systolic arrays, accelerators, DSP blocks, peripherals, and any digital design without fabricating instruction traces
