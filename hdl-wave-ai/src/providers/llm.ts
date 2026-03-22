@@ -26,6 +26,12 @@ export interface ToolDefinition {
     parameters: object;
 }
 
+export interface ToolLoopOptions {
+    /** When true, the question is conceptual (e.g. "what does X do?") and
+     *  the model may answer directly from HDL context without tool calls. */
+    allowDirectAnswer?: boolean;
+}
+
 export interface LLMProvider {
     chat(messages: LLMMessage[]): Promise<string>;
     stream(messages: LLMMessage[], signal?: AbortSignal): AsyncGenerator<string>;
@@ -41,6 +47,7 @@ export interface LLMProvider {
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
         hdlContext?: string,
+        options?: ToolLoopOptions,
     ): Promise<string>;
 }
 

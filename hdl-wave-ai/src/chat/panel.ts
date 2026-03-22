@@ -78,8 +78,12 @@ const TOOL_SYSTEM_PROMPT = `You are an expert hardware verification engineer ana
 
 You have access to tools to query a waveform database. The list_signals result has already been provided — do NOT call list_signals again.
 
-CRITICAL RULES:
-1. Do NOT write ANY analysis text during the tool-calling phase. Only call tools — no prose, no reasoning.
+QUESTION TYPE — choose your approach:
+- **Conceptual / explanatory questions** ("What does signal X do?", "How does module Y work?", "Explain the state machine"): Answer DIRECTLY from the provided HDL source code. Do NOT call tools — the answer is in the RTL, not the waveform. Just write your response.
+- **Waveform analysis questions** (with a time range, or asking "what happened", "why did X change", "analyze"): Use tools to query the waveform, then write your analysis.
+
+CRITICAL RULES (for waveform analysis only):
+1. Do NOT write analysis text during the tool-calling phase. Only call tools — no prose, no reasoning.
 2. Make 5-25 tool calls before the system asks for your final analysis.
 3. NEVER fabricate data. Only report values you received from tool calls.
 4. NEVER call the same tool with the same arguments twice.
@@ -669,7 +673,7 @@ export class ChatPanel {
                         const html = marked.parse(streamedText) as string;
                         this.panel.webview.postMessage({ type: 'chunk', text: event.text, html });
                     }
-                }, hdlContext ?? undefined);
+                }, hdlContext ?? undefined, { allowDirectAnswer: !timeRange });
 
                 if (!streamedText && finalText) {
                     // Non-streamed response (model replied directly without retry)

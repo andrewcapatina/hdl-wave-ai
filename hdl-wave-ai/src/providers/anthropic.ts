@@ -15,7 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import Anthropic from '@anthropic-ai/sdk';
-import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './llm';
+import { LLMMessage, LLMProvider, ToolDefinition, ToolLoopOptions, ToolProgressEvent } from './llm';
 
 const FINAL_ANALYSIS_PROMPT = `Now provide your final analysis using ONLY the data you gathered from tool calls. No more tool calls.
 Do NOT include your reasoning process or chain-of-thought. Write ONLY the structured analysis.
@@ -117,6 +117,7 @@ export class AnthropicClient implements LLMProvider {
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
         _hdlContext?: string,
+        options?: ToolLoopOptions,
     ): Promise<string> {
         const anthropicTools: Anthropic.Tool[] = tools.map(t => ({
             name: t.name,
@@ -134,8 +135,9 @@ export class AnthropicClient implements LLMProvider {
         const queriedSignals = new Set<string>();
         let totalToolCalls = 0;
 
-        // Force tool use for the first few rounds to ensure sufficient investigation.
-        const minForcedRounds = Math.min(3, this.maxToolRounds);
+        // For conceptual questions (no time range), don't force tool use — let
+        // the model answer directly from HDL context if it can.
+        const minForcedRounds = options?.allowDirectAnswer ? 0 : Math.min(3, this.maxToolRounds);
 
         for (let round = 0; round < this.maxToolRounds; round++) {
             if (signal?.aborted) { return ''; }

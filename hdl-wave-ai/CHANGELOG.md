@@ -4,6 +4,19 @@ All notable changes to the "hdl-wave-ai" extension will be documented in this fi
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.2.7] - 2026-03-21
+
+### Added
+- **Conceptual question detection** — questions like "What does signal X do?" or "How does module Y work?" are now answered directly from HDL source context without forcing waveform tool calls. New `allowDirectAnswer` option in `ToolLoopOptions` skips forced tool rounds when no time range is present
+- **`ToolLoopOptions` interface** — providers accept an `options` parameter to control tool loop behavior (e.g. `allowDirectAnswer`), passed through from the chat panel based on query context
+
+### Improved
+- **System prompt distinguishes question types** — new "QUESTION TYPE" section tells the model to answer conceptual/explanatory questions directly from RTL source, and only use tools for waveform analysis questions with time ranges
+- **Forced rounds are context-aware** — `minForcedRounds` is set to 0 when `allowDirectAnswer` is true (no time range), allowing the model to respond immediately from HDL context. Waveform analysis queries with a time range still enforce 3 forced rounds
+
+### Fixed
+- Model making unnecessary waveform tool calls for simple questions about signal purpose or module behavior (e.g. "What does pe_enable do?" triggered 3+ query_transitions calls instead of answering from the Verilog source)
+
 ## [0.2.6] - 2026-03-21
 
 ### Added

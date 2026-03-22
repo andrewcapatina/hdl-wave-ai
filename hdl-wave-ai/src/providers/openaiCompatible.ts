@@ -15,7 +15,7 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 import OpenAI from 'openai';
-import { LLMMessage, LLMProvider, ToolDefinition, ToolProgressEvent } from './llm';
+import { LLMMessage, LLMProvider, ToolDefinition, ToolLoopOptions, ToolProgressEvent } from './llm';
 
 const FINAL_ANALYSIS_PROMPT = `Now provide your final analysis using ONLY the data you gathered from tool calls. No more tool calls.
 
@@ -250,11 +250,12 @@ export class OpenAICompatibleClient implements LLMProvider {
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
         hdlContext?: string,
+        options?: ToolLoopOptions,
     ): Promise<string> {
         if (this.useCompletions) {
-            return this.chatWithToolsCompletions(messages, tools, toolExecutor, signal, onProgress, hdlContext);
+            return this.chatWithToolsCompletions(messages, tools, toolExecutor, signal, onProgress, hdlContext, options);
         }
-        return this.chatWithToolsChat(messages, tools, toolExecutor, signal, onProgress, hdlContext);
+        return this.chatWithToolsChat(messages, tools, toolExecutor, signal, onProgress, hdlContext, options);
     }
 
     // ── Tool loop via /v1/completions (ChatML + text parsing) ───────────
@@ -340,6 +341,7 @@ export class OpenAICompatibleClient implements LLMProvider {
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
         hdlContext?: string,
+        options?: ToolLoopOptions,
     ): Promise<string> {
         // Inject tool definitions into the system message
         const msgs = messages.map(m => ({ ...m }));
@@ -365,7 +367,7 @@ export class OpenAICompatibleClient implements LLMProvider {
         const maxPromptTokens = this.maxPromptTokens - 4096;
 
         // Tool loop — force tool use for first few rounds
-        const minForcedRounds = Math.min(3, this.maxToolRounds);
+        const minForcedRounds = options?.allowDirectAnswer ? 0 : Math.min(3, this.maxToolRounds);
         let totalToolCalls = 0;
         const queriedSignals = new Set<string>();
 
@@ -516,6 +518,7 @@ export class OpenAICompatibleClient implements LLMProvider {
         signal?: AbortSignal,
         onProgress?: (event: ToolProgressEvent) => void,
         hdlContext?: string,
+        options?: ToolLoopOptions,
     ): Promise<string> {
         const oaiTools: OpenAI.ChatCompletionTool[] = tools.map(t => ({
             type: 'function' as const,
@@ -547,7 +550,7 @@ export class OpenAICompatibleClient implements LLMProvider {
         msgs.push({ role: 'tool', tool_call_id: fakeCallId, content: listResult });
 
         // Force tool use for the first few rounds to ensure sufficient data gathering
-        const minForcedRounds = Math.min(3, this.maxToolRounds);
+        const minForcedRounds = options?.allowDirectAnswer ? 0 : Math.min(3, this.maxToolRounds);
         let totalToolCalls = 0;
         const queriedSignals = new Set<string>();
 
